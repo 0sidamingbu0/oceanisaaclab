@@ -125,3 +125,8 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     target_base_height = 0.42  # [m]
     min_base_height = 0.25  # [m]
     min_upright_projection = 0.65
+    # - random lateral push disturbance
+    enable_random_push = True
+    push_force_range = (5.0, 15.0)  # [N]
+    push_duration_s = 0.10
+    push_interval_s = (2.0, 4.0)

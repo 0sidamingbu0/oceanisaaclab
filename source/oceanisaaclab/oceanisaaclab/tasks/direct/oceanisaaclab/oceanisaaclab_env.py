@@ -25,11 +25,16 @@ class OceanisaaclabEnv(DirectRLEnv):
 
         self._leg_dof_idx = self._find_joint_ids(self.cfg.leg_joint_names)
         self._neck_dof_idx = self._find_joint_ids(self.cfg.neck_joint_names)
+        self._base_body_id, _ = self.robot.find_bodies("base_link")
 
         self._actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._previous_actions = torch.zeros_like(self._actions)
         self._processed_actions = torch.zeros_like(self._actions)
         self._commands = torch.zeros(self.num_envs, 3, device=self.device)
+        self._push_forces = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self._push_torques = torch.zeros_like(self._push_forces)
+        self._push_time_left = torch.zeros(self.num_envs, device=self.device)
+        self._push_interval_left = torch.zeros(self.num_envs, device=self.device)
         self._command_scale = torch.tensor(
             self.cfg.command_scale, dtype=torch.float, device=self.device
         )
@@ -85,10 +90,47 @@ class OceanisaaclabEnv(DirectRLEnv):
             self._soft_leg_joint_pos_limits[:, :, 0],
             self._soft_leg_joint_pos_limits[:, :, 1],
         )
+        self._update_random_pushes()
 
     def _apply_action(self) -> None:
         self.robot.set_joint_position_target_index(target=self._processed_actions, joint_ids=self._leg_dof_idx)
         self.robot.set_joint_position_target_index(target=self._default_neck_joint_pos, joint_ids=self._neck_dof_idx)
+
+    def _update_random_pushes(self) -> None:
+        if not self.cfg.enable_random_push:
+            return
+
+        self._push_time_left = torch.clamp(self._push_time_left - self.step_dt, min=0.0)
+        self._push_interval_left = torch.clamp(self._push_interval_left - self.step_dt, min=0.0)
+        start_push = (self._push_interval_left <= 0.0) & (self._push_time_left <= 0.0)
+        if torch.any(start_push):
+            env_ids = torch.nonzero(start_push, as_tuple=False).squeeze(-1)
+            angles = torch.rand(len(env_ids), device=self.device) * 2.0 * torch.pi
+            magnitudes = sample_uniform(
+                self.cfg.push_force_range[0],
+                self.cfg.push_force_range[1],
+                (len(env_ids),),
+                self.device,
+            )
+            self._push_forces[env_ids, 0, 0] = magnitudes * torch.cos(angles)
+            self._push_forces[env_ids, 0, 1] = magnitudes * torch.sin(angles)
+            self._push_forces[env_ids, 0, 2] = 0.0
+            self._push_time_left[env_ids] = self.cfg.push_duration_s
+            self._push_interval_left[env_ids] = sample_uniform(
+                self.cfg.push_interval_s[0],
+                self.cfg.push_interval_s[1],
+                (len(env_ids),),
+                self.device,
+            )
+
+        inactive = self._push_time_left <= 0.0
+        self._push_forces[inactive] = 0.0
+        self.robot.permanent_wrench_composer.set_forces_and_torques(
+            self._push_forces,
+            self._push_torques,
+            body_ids=self._base_body_id,
+            is_global=True,
+        )
 
     def _get_observations(self) -> dict:
         obs = torch.cat(
@@ -155,6 +197,15 @@ class OceanisaaclabEnv(DirectRLEnv):
         self._previous_actions[env_ids] = 0.0
         self._processed_actions[env_ids] = self._default_leg_joint_pos[env_ids]
         self._commands[env_ids] = 0.0
+        self._push_forces[env_ids] = 0.0
+        self._push_torques[env_ids] = 0.0
+        self._push_time_left[env_ids] = 0.0
+        self._push_interval_left[env_ids] = sample_uniform(
+            self.cfg.push_interval_s[0],
+            self.cfg.push_interval_s[1],
+            (len(env_ids),),
+            self.device,
+        )
 
         joint_pos = self.robot.data.default_joint_pos.torch[env_ids].clone()
         joint_pos[:, self._leg_dof_idx] += sample_uniform(
