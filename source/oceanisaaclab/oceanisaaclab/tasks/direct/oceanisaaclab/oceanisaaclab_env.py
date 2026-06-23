@@ -155,6 +155,7 @@ class OceanisaaclabEnv(DirectRLEnv):
             self.cfg.rew_scale_upright,
             self.cfg.rew_scale_height,
             self.cfg.rew_scale_ang_vel,
+            self.cfg.rew_scale_lin_vel,
             self.cfg.rew_scale_joint_pos,
             self.cfg.rew_scale_joint_vel,
             self.cfg.rew_scale_action_rate,
@@ -247,6 +248,7 @@ def compute_rewards(
     rew_scale_upright: float,
     rew_scale_height: float,
     rew_scale_ang_vel: float,
+    rew_scale_lin_vel: float,
     rew_scale_joint_pos: float,
     rew_scale_joint_vel: float,
     rew_scale_action_rate: float,
@@ -268,7 +270,7 @@ def compute_rewards(
     rew_height = rew_scale_height * torch.exp(-20.0 * torch.square(base_height - target_base_height))
     rew_ang_vel = rew_scale_ang_vel * torch.sum(torch.square(root_ang_vel_b), dim=1)
     lin_vel_error = torch.sum(torch.square(commands[:, :2] - root_lin_vel_b[:, :2]), dim=1)
-    rew_lin_vel = -0.5 * lin_vel_error
+    rew_lin_vel = rew_scale_lin_vel * lin_vel_error
     rew_joint_pos = rew_scale_joint_pos * torch.sum(torch.square(joint_pos_error), dim=1)
     rew_joint_vel = rew_scale_joint_vel * torch.sum(torch.square(joint_vel), dim=1)
     rew_action_rate = rew_scale_action_rate * torch.sum(torch.square(actions - previous_actions), dim=1)

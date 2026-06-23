@@ -13,13 +13,14 @@ Ocean-BDX-Stand-Direct-v0
 训练入口继续使用本工程已有脚本：
 
 ```bash
-./_isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py --task Ocean-BDX-Stand-Direct-v0 --num_envs 2048
+./_isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py --task Ocean-BDX-Stand-Direct-v0 --num_envs 2048 --viz kit
 ```
 
 回放和导出：
 
 ```bash
 ./_isaaclab/isaaclab.sh -p scripts/rsl_rl/play.py --task Ocean-BDX-Stand-Direct-v0 --num_envs 16 --checkpoint <model.pt>
+./_isaaclab/isaaclab.sh -p scripts/rsl_rl/play.py --task Ocean-BDX-Stand-Direct-v0 --num_envs 16 --viz kit
 ```
 
 `play.py` 会导出：
@@ -114,24 +115,32 @@ velocity_limit = 6.0 rad/s
 
 这与 `/home/ocean/oceanbdx/config/oceanbdx.yaml` 里的 `control.rl_kp`、`control.rl_kd`、`torque_limits` 对齐。若实机上必须降增益，推荐先在 sim2sim 和 Isaac 里同步降，再导出新策略。
 
-## 随机侧推扰动
+## 强侧推扰动
 
-当前训练环境已默认加入轻量随机侧向外力，用于提升站立抗扰性。外力作用在 `base_link`，方向在世界系 XY 平面随机：
+当前训练环境已默认加入较强随机侧向外力，用于让策略学会明显的迈步/姿态恢复动作，并方便在 sim2sim 中验证策略是否生效。外力作用在 `base_link`，方向在世界系 XY 平面随机：
 
 ```text
 enable_random_push = True
-push_force_range = (5.0, 15.0) N
-push_duration_s = 0.10 s
-push_interval_s = (2.0, 4.0) s
+push_force_range = (35.0, 65.0) N
+push_duration_s = 0.18 s
+push_interval_s = (1.0, 2.0) s
 ```
 
-这组参数比较保守，适合在已经能稳定站立后继续训练。如果策略开始明显抖动或学成过硬的蹲姿，可以先关闭：
+为了让机器人有空间做恢复动作，训练中同步放松了关节回零、关节速度、动作变化率和线速度惩罚。这个版本更适合做“抗侧推 sim2sim 验证”，不再是最安静的原地站立版本。
+
+如果策略在训练早期频繁摔倒，可以先降到 `20-40 N`，训稳后再回到 `35-65 N`：
+
+```bash
+./_isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py --task Ocean-BDX-Stand-Direct-v0 --num_envs 2048 env.push_force_range='(20.0, 40.0)'
+```
+
+如果需要回到无扰动站立基线，可以关闭：
 
 ```bash
 ./_isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py --task Ocean-BDX-Stand-Direct-v0 --num_envs 2048 env.enable_random_push=False
 ```
 
-也可以逐步加大外力，例如先到 `10-25 N`，再根据 sim2sim 表现决定是否继续增加。实机部署侧不要直接复现随机推力，只需要用这个训练出来的策略做外界扰动鲁棒性验证。
+实机部署侧不要直接复现随机推力，只需要用这个训练出来的策略做外界扰动鲁棒性验证。
 
 ## 频率
 

@@ -117,9 +117,10 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     rew_scale_upright = 2.0
     rew_scale_height = 1.0
     rew_scale_ang_vel = -0.05
-    rew_scale_joint_pos = -0.4
-    rew_scale_joint_vel = -0.01
-    rew_scale_action_rate = -0.02
+    rew_scale_lin_vel = -0.15
+    rew_scale_joint_pos = -0.08
+    rew_scale_joint_vel = -0.005
+    rew_scale_action_rate = -0.01
     # - reset states/conditions
     reset_joint_pos_noise = 0.02  # [rad]
     target_base_height = 0.42  # [m]
@@ -127,6 +128,6 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     min_upright_projection = 0.65
     # - random lateral push disturbance
     enable_random_push = True
-    push_force_range = (5.0, 15.0)  # [N]
-    push_duration_s = 0.10
-    push_interval_s = (2.0, 4.0)
+    push_force_range = (35.0, 65.0)  # [N]
+    push_duration_s = 0.18
+    push_interval_s = (1.0, 2.0)
