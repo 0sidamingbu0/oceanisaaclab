@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import math
 import torch
 from collections.abc import Sequence
 
@@ -24,11 +23,43 @@ class OceanisaaclabEnv(DirectRLEnv):
     def __init__(self, cfg: OceanisaaclabEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
-        self._cart_dof_idx, _ = self.robot.find_joints(self.cfg.cart_dof_name)
-        self._pole_dof_idx, _ = self.robot.find_joints(self.cfg.pole_dof_name)
+        self._leg_dof_idx = self._find_joint_ids(self.cfg.leg_joint_names)
+        self._neck_dof_idx = self._find_joint_ids(self.cfg.neck_joint_names)
 
-        self.joint_pos = self.robot.data.joint_pos
-        self.joint_vel = self.robot.data.joint_vel
+        self._actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+        self._previous_actions = torch.zeros_like(self._actions)
+        self._processed_actions = torch.zeros_like(self._actions)
+        self._commands = torch.zeros(self.num_envs, 3, device=self.device)
+        self._command_scale = torch.tensor(
+            self.cfg.command_scale, dtype=torch.float, device=self.device
+        )
+
+        self._default_leg_joint_pos = self.robot.data.default_joint_pos.torch[:, self._leg_dof_idx].clone()
+        self._soft_leg_joint_pos_limits = self.robot.data.soft_joint_pos_limits.torch[:, self._leg_dof_idx].clone()
+        self._default_neck_joint_pos = self.robot.data.default_joint_pos.torch[:, self._neck_dof_idx].clone()
+        self._episode_sums = {
+            key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            for key in [
+                "alive",
+                "terminated",
+                "upright",
+                "height",
+                "ang_vel",
+                "lin_vel",
+                "joint_pos",
+                "joint_vel",
+                "action_rate",
+            ]
+        }
+
+    def _find_joint_ids(self, joint_names: Sequence[str]) -> list[int]:
+        joint_ids = []
+        for joint_name in joint_names:
+            ids, names = self.robot.find_joints(joint_name)
+            if len(ids) != 1:
+                raise RuntimeError(f"Expected one joint named '{joint_name}', found {names}.")
+            joint_ids.append(ids[0])
+        return joint_ids
 
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
@@ -46,18 +77,29 @@ class OceanisaaclabEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        self.actions = actions.clone()
+        self._previous_actions = self._actions.clone()
+        self._actions = actions.clamp(-1.0, 1.0)
+        desired_joint_pos = self._default_leg_joint_pos + self.cfg.action_scale * self._actions
+        self._processed_actions = torch.clamp(
+            desired_joint_pos,
+            self._soft_leg_joint_pos_limits[:, :, 0],
+            self._soft_leg_joint_pos_limits[:, :, 1],
+        )
 
     def _apply_action(self) -> None:
-        self.robot.set_joint_effort_target(self.actions * self.cfg.action_scale, joint_ids=self._cart_dof_idx)
+        self.robot.set_joint_position_target_index(target=self._processed_actions, joint_ids=self._leg_dof_idx)
+        self.robot.set_joint_position_target_index(target=self._default_neck_joint_pos, joint_ids=self._neck_dof_idx)
 
     def _get_observations(self) -> dict:
         obs = torch.cat(
             (
-                self.joint_pos[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
-                self.joint_vel[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
-                self.joint_pos[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
-                self.joint_vel[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
+                self.robot.data.root_ang_vel_b.torch * self.cfg.ang_vel_scale,
+                self.robot.data.projected_gravity_b.torch,
+                self._commands * self._command_scale,
+                (self.robot.data.joint_pos.torch[:, self._leg_dof_idx] - self._default_leg_joint_pos)
+                * self.cfg.dof_pos_scale,
+                self.robot.data.joint_vel.torch[:, self._leg_dof_idx] * self.cfg.dof_vel_scale,
+                self._actions,
             ),
             dim=-1,
         )
@@ -65,71 +107,140 @@ class OceanisaaclabEnv(DirectRLEnv):
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        total_reward = compute_rewards(
+        total_reward, reward_terms = compute_rewards(
             self.cfg.rew_scale_alive,
             self.cfg.rew_scale_terminated,
-            self.cfg.rew_scale_pole_pos,
-            self.cfg.rew_scale_cart_vel,
-            self.cfg.rew_scale_pole_vel,
-            self.joint_pos[:, self._pole_dof_idx[0]],
-            self.joint_vel[:, self._pole_dof_idx[0]],
-            self.joint_pos[:, self._cart_dof_idx[0]],
-            self.joint_vel[:, self._cart_dof_idx[0]],
+            self.cfg.rew_scale_upright,
+            self.cfg.rew_scale_height,
+            self.cfg.rew_scale_ang_vel,
+            self.cfg.rew_scale_joint_pos,
+            self.cfg.rew_scale_joint_vel,
+            self.cfg.rew_scale_action_rate,
+            self.cfg.target_base_height,
+            self.robot.data.root_pos_w.torch[:, 2],
+            self._commands,
+            self.robot.data.root_lin_vel_b.torch,
+            self.robot.data.projected_gravity_b.torch,
+            self.robot.data.root_ang_vel_b.torch,
+            self.robot.data.joint_pos.torch[:, self._leg_dof_idx] - self._default_leg_joint_pos,
+            self.robot.data.joint_vel.torch[:, self._leg_dof_idx],
+            self._actions,
+            self._previous_actions,
             self.reset_terminated,
         )
+        for key, value in reward_terms.items():
+            self._episode_sums[key] += value
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        self.joint_pos = self.robot.data.joint_pos
-        self.joint_vel = self.robot.data.joint_vel
-
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        out_of_bounds = torch.any(torch.abs(self.joint_pos[:, self._cart_dof_idx]) > self.cfg.max_cart_pos, dim=1)
-        out_of_bounds = out_of_bounds | torch.any(torch.abs(self.joint_pos[:, self._pole_dof_idx]) > math.pi / 2, dim=1)
-        return out_of_bounds, time_out
+        base_too_low = self.robot.data.root_pos_w.torch[:, 2] < self.cfg.min_base_height
+        not_upright = -self.robot.data.projected_gravity_b.torch[:, 2] < self.cfg.min_upright_projection
+        joint_pos = self.robot.data.joint_pos.torch[:, self._leg_dof_idx]
+        lower_limit = self.robot.data.soft_joint_pos_limits.torch[:, self._leg_dof_idx, 0]
+        upper_limit = self.robot.data.soft_joint_pos_limits.torch[:, self._leg_dof_idx, 1]
+        joint_out_of_bounds = torch.any((joint_pos < lower_limit) | (joint_pos > upper_limit), dim=1)
+        return base_too_low | not_upright | joint_out_of_bounds, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
-            env_ids = self.robot._ALL_INDICES
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        elif not isinstance(env_ids, torch.Tensor):
+            env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
+        else:
+            env_ids = env_ids.to(device=self.device, dtype=torch.long)
         super()._reset_idx(env_ids)
 
-        joint_pos = self.robot.data.default_joint_pos[env_ids]
-        joint_pos[:, self._pole_dof_idx] += sample_uniform(
-            self.cfg.initial_pole_angle_range[0] * math.pi,
-            self.cfg.initial_pole_angle_range[1] * math.pi,
-            joint_pos[:, self._pole_dof_idx].shape,
+        self._actions[env_ids] = 0.0
+        self._previous_actions[env_ids] = 0.0
+        self._processed_actions[env_ids] = self._default_leg_joint_pos[env_ids]
+        self._commands[env_ids] = 0.0
+
+        joint_pos = self.robot.data.default_joint_pos.torch[env_ids].clone()
+        joint_pos[:, self._leg_dof_idx] += sample_uniform(
+            -self.cfg.reset_joint_pos_noise,
+            self.cfg.reset_joint_pos_noise,
+            joint_pos[:, self._leg_dof_idx].shape,
             joint_pos.device,
         )
-        joint_vel = self.robot.data.default_joint_vel[env_ids]
+        joint_pos[:, self._leg_dof_idx] = torch.clamp(
+            joint_pos[:, self._leg_dof_idx],
+            self.robot.data.soft_joint_pos_limits.torch[env_ids][:, self._leg_dof_idx, 0],
+            self.robot.data.soft_joint_pos_limits.torch[env_ids][:, self._leg_dof_idx, 1],
+        )
+        joint_pos[:, self._neck_dof_idx] = 0.0
+        joint_vel = self.robot.data.default_joint_vel.torch[env_ids].clone()
 
-        default_root_state = self.robot.data.default_root_state[env_ids]
-        default_root_state[:, :3] += self.scene.env_origins[env_ids]
+        default_root_pose = self.robot.data.default_root_pose.torch[env_ids].clone()
+        default_root_vel = self.robot.data.default_root_vel.torch[env_ids].clone()
+        default_root_pose[:, :3] += self.scene.env_origins[env_ids]
 
-        self.joint_pos[env_ids] = joint_pos
-        self.joint_vel[env_ids] = joint_vel
+        self.robot.write_root_pose_to_sim_index(root_pose=default_root_pose, env_ids=env_ids)
+        self.robot.write_root_velocity_to_sim_index(root_velocity=default_root_vel, env_ids=env_ids)
+        self.robot.write_joint_position_to_sim_index(position=joint_pos, env_ids=env_ids)
+        self.robot.write_joint_velocity_to_sim_index(velocity=joint_vel, env_ids=env_ids)
 
-        self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
-        self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
-        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+        extras = {}
+        for key in self._episode_sums.keys():
+            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
+            extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
+            self._episode_sums[key][env_ids] = 0.0
+        extras["Episode_Termination/fall"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
+        extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
+        self.extras["log"] = extras
 
 
-@torch.jit.script
 def compute_rewards(
     rew_scale_alive: float,
     rew_scale_terminated: float,
-    rew_scale_pole_pos: float,
-    rew_scale_cart_vel: float,
-    rew_scale_pole_vel: float,
-    pole_pos: torch.Tensor,
-    pole_vel: torch.Tensor,
-    cart_pos: torch.Tensor,
-    cart_vel: torch.Tensor,
+    rew_scale_upright: float,
+    rew_scale_height: float,
+    rew_scale_ang_vel: float,
+    rew_scale_joint_pos: float,
+    rew_scale_joint_vel: float,
+    rew_scale_action_rate: float,
+    target_base_height: float,
+    base_height: torch.Tensor,
+    commands: torch.Tensor,
+    root_lin_vel_b: torch.Tensor,
+    projected_gravity_b: torch.Tensor,
+    root_ang_vel_b: torch.Tensor,
+    joint_pos_error: torch.Tensor,
+    joint_vel: torch.Tensor,
+    actions: torch.Tensor,
+    previous_actions: torch.Tensor,
     reset_terminated: torch.Tensor,
 ):
     rew_alive = rew_scale_alive * (1.0 - reset_terminated.float())
     rew_termination = rew_scale_terminated * reset_terminated.float()
-    rew_pole_pos = rew_scale_pole_pos * torch.sum(torch.square(pole_pos).unsqueeze(dim=1), dim=-1)
-    rew_cart_vel = rew_scale_cart_vel * torch.sum(torch.abs(cart_vel).unsqueeze(dim=1), dim=-1)
-    rew_pole_vel = rew_scale_pole_vel * torch.sum(torch.abs(pole_vel).unsqueeze(dim=1), dim=-1)
-    total_reward = rew_alive + rew_termination + rew_pole_pos + rew_cart_vel + rew_pole_vel
-    return total_reward
+    rew_upright = rew_scale_upright * torch.exp(-4.0 * torch.sum(torch.square(projected_gravity_b[:, :2]), dim=1))
+    rew_height = rew_scale_height * torch.exp(-20.0 * torch.square(base_height - target_base_height))
+    rew_ang_vel = rew_scale_ang_vel * torch.sum(torch.square(root_ang_vel_b), dim=1)
+    lin_vel_error = torch.sum(torch.square(commands[:, :2] - root_lin_vel_b[:, :2]), dim=1)
+    rew_lin_vel = -0.5 * lin_vel_error
+    rew_joint_pos = rew_scale_joint_pos * torch.sum(torch.square(joint_pos_error), dim=1)
+    rew_joint_vel = rew_scale_joint_vel * torch.sum(torch.square(joint_vel), dim=1)
+    rew_action_rate = rew_scale_action_rate * torch.sum(torch.square(actions - previous_actions), dim=1)
+    total_reward = (
+        rew_alive
+        + rew_termination
+        + rew_upright
+        + rew_height
+        + rew_ang_vel
+        + rew_lin_vel
+        + rew_joint_pos
+        + rew_joint_vel
+        + rew_action_rate
+    )
+    reward_terms = {
+        "alive": rew_alive,
+        "terminated": rew_termination,
+        "upright": rew_upright,
+        "height": rew_height,
+        "ang_vel": rew_ang_vel,
+        "lin_vel": rew_lin_vel,
+        "joint_pos": rew_joint_pos,
+        "joint_vel": rew_joint_vel,
+        "action_rate": rew_action_rate,
+    }
+    return total_reward, reward_terms

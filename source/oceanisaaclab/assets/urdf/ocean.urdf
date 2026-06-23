@@ -1,0 +1,917 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot
+  name="ocean">
+  <link
+    name="base_link">
+    <inertial>
+      <origin
+        xyz="0.033838 -0.0012004 -0.053283"
+        rpy="0 0 0" />
+      <mass
+        value="4.2921" />
+      <inertia
+        ixx="0.013397"
+        ixy="8.1389E-06"
+        ixz="-0.0001569"
+        iyy="0.010717"
+        iyz="2.9147E-05"
+        izz="0.00908" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/base_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.79216 0.81961 0.93333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link
+    name="leg_r1_link">
+    <inertial>
+      <origin
+        xyz="-0.0041199 -0.0058777 0.050037"
+        rpy="0 0 0" />
+      <mass
+        value="0.33146" />
+      <inertia
+        ixx="0.00049845"
+        ixy="-4.5537E-08"
+        ixz="2.2168E-05"
+        iyy="0.00030507"
+        iyz="2.0354E-06"
+        izz="0.00025744" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_r1_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_r1_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="leg_r1_joint"
+    type="revolute">
+    <origin
+      xyz="0.020771 0.045349 -0.0423"
+      rpy="-3.1416 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="leg_r1_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-0.436"
+      upper="0.349"
+      effort="100"
+      velocity="6" />
+  </joint>
+  <link
+    name="leg_r2_link">
+    <inertial>
+      <origin
+        xyz="-0.03259 -8.6224E-05 0.0065541"
+        rpy="0 0 0" />
+      <mass
+        value="0.15568" />
+      <inertia
+        ixx="6.954E-05"
+        ixy="-1.8081E-07"
+        ixz="-1.0241E-05"
+        iyy="0.00016138"
+        iyz="-1.4022E-07"
+        izz="0.00018569" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_r2_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_r2_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="leg_r2_joint"
+    type="revolute">
+    <origin
+      xyz="-0.019601 -0.0054769 0.055609"
+      rpy="-1.5708 0 1.5708" />
+    <parent
+      link="leg_r1_link" />
+    <child
+      link="leg_r2_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-0.750"
+      upper="0.262"
+      effort="100"
+      velocity="6" />
+  </joint>
+  <link
+    name="leg_r3_link">
+    <inertial>
+      <origin
+        xyz="-0.039555 -0.043339 -0.018416"
+        rpy="0 0 0" />
+      <mass
+        value="0.73927" />
+      <inertia
+        ixx="0.0010276"
+        ixy="-0.00040466"
+        ixz="-9.9665E-06"
+        iyy="0.0008075"
+        iyz="-1.4606E-05"
+        izz="0.0017539" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_r3_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_r3_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="leg_r3_joint"
+    type="revolute">
+    <origin
+      xyz="-0.0697599164232302 0 0.0033867789847717"
+      rpy="1.5707963267949 0 1.5707963267949" />
+    <parent
+      link="leg_r2_link" />
+    <child
+      link="leg_r3_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-1.361"
+      upper="0.489"
+      effort="100"
+      velocity="6" />
+  </joint>
+  <link
+    name="leg_r4_link">
+    <inertial>
+      <origin
+        xyz="-0.085353 0.013534 0.014528"
+        rpy="0 0 0" />
+      <mass
+        value="0.45582" />
+      <inertia
+        ixx="0.00023248"
+        ixy="8.0216E-06"
+        ixz="1.5757E-05"
+        iyy="0.00060487"
+        iyz="-8.9449E-07"
+        izz="0.00078197" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_r4_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_r4_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="leg_r4_joint"
+    type="revolute">
+    <origin
+      xyz="-0.0848592981439465 -0.0848505720845361 0"
+      rpy="0 0 0" />
+    <parent
+      link="leg_r3_link" />
+    <child
+      link="leg_r4_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-0.803"
+      upper="1.344"
+      effort="100"
+      velocity="6" />
+  </joint>
+  <link
+    name="leg_r5_link">
+    <inertial>
+      <origin
+        xyz="0.033054 -0.046256 -0.011541"
+        rpy="0 0 0" />
+      <mass
+        value="0.45151" />
+      <inertia
+        ixx="0.00024156"
+        ixy="-1.2357E-05"
+        ixz="2.5375E-05"
+        iyy="0.0013142"
+        iyz="-5.2075E-05"
+        izz="0.0014125" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_r5_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_r5_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="leg_r5_joint"
+    type="revolute">
+    <origin
+      xyz="-0.13521227428467 0.0362544405667555 -0.00435000000000058"
+      rpy="3.14159265358979 0 1.5707963267949" />
+    <parent
+      link="leg_r4_link" />
+    <child
+      link="leg_r5_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-1.396"
+      upper="1.134"
+      effort="100"
+      velocity="6" />
+  </joint>
+  <link
+    name="leg_l1_link">
+    <inertial>
+      <origin
+        xyz="-0.0041201 0.0059563 0.050091"
+        rpy="0 0 0" />
+      <mass
+        value="0.33145" />
+      <inertia
+        ixx="0.00049843"
+        ixy="8.2046E-08"
+        ixz="2.2204E-05"
+        iyy="0.00030579"
+        iyz="-2.0461E-06"
+        izz="0.0002567" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_l1_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_l1_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="leg_l1_joint"
+    type="revolute">
+    <origin
+      xyz="0.0207708926338017 -0.0471505964321851 -0.0422999999999991"
+      rpy="-3.14159265358979 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="leg_l1_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-0.349"
+      upper="0.436"
+      effort="100"
+      velocity="6" />
+  </joint>
+  <link
+    name="leg_l2_link">
+    <inertial>
+      <origin
+        xyz="-0.032589 8.2716E-05 0.0065541"
+        rpy="0 0 0" />
+      <mass
+        value="0.12555" />
+      <inertia
+        ixx="5.608E-05"
+        ixy="1.4018E-07"
+        ixz="-8.2598E-06"
+        iyy="0.00013015"
+        iyz="1.1035E-07"
+        izz="0.00014975" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_l2_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_l2_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="leg_l2_joint"
+    type="revolute">
+    <origin
+      xyz="-0.01960079285411 0.00550443611557444 0.0556099164232253"
+      rpy="1.5707963267949 7.30362053830224E-05 -1.5707963267949" />
+    <parent
+      link="leg_l1_link" />
+    <child
+      link="leg_l2_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-0.262"
+      upper="0.750"
+      effort="100"
+      velocity="6" />
+  </joint>
+  <link
+    name="leg_l3_link">
+    <inertial>
+      <origin
+        xyz="-0.039591 0.043396 -0.018481"
+        rpy="0 0 0" />
+      <mass
+        value="0.73927" />
+      <inertia
+        ixx="0.0010267"
+        ixy="0.00040554"
+        ixz="-9.9149E-06"
+        iyy="0.00080838"
+        iyz="1.4572E-05"
+        izz="0.0017538" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_l3_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_l3_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="leg_l3_joint"
+    type="revolute">
+    <origin
+      xyz="-0.0697587935046286 -1.75243179483114E-05 0.0034130140446374"
+      rpy="-1.57079632679498 0 -1.57072329058951" />
+    <parent
+      link="leg_l2_link" />
+    <child
+      link="leg_l3_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-0.489"
+      upper="1.361"
+      effort="100"
+      velocity="6" />
+  </joint>
+  <link
+    name="leg_l4_link">
+    <inertial>
+      <origin
+        xyz="0.013624 -0.085298 0.014354"
+        rpy="0 0 0" />
+      <mass
+        value="0.4525" />
+      <inertia
+        ixx="0.00060395"
+        ixy="7.9873E-06"
+        ixz="-8.5109E-07"
+        iyy="0.00023313"
+        iyz="1.58E-05"
+        izz="0.00078176" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_l4_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_l4_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="leg_l4_joint"
+    type="revolute">
+    <origin
+      xyz="-0.0848640099907751 0.0848758418377773 0"
+      rpy="0 0 -1.5707963267949" />
+    <parent
+      link="leg_l3_link" />
+    <child
+      link="leg_l4_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-1.344"
+      upper="0.803"
+      effort="100"
+      velocity="6" />
+  </joint>
+  <link
+    name="leg_l5_link">
+    <inertial>
+      <origin
+        xyz="-0.034306 -0.042595 -0.010554"
+        rpy="0 0 0" />
+      <mass
+        value="0.39976" />
+      <inertia
+        ixx="0.00023673"
+        ixy="1.2067E-05"
+        ixz="-2.5385E-05"
+        iyy="0.0011524"
+        iyz="-5.209E-05"
+        izz="0.001255" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_l5_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/leg_l5_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="leg_l5_joint"
+    type="revolute">
+    <origin
+      xyz="0.036235 -0.13523 -0.00435"
+      rpy="3.1416 0 3.1416" />
+    <parent
+      link="leg_l4_link" />
+    <child
+      link="leg_l5_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-1.134"
+      upper="1.396"
+      effort="100"
+      velocity="6" />
+  </joint>
+  <link
+    name="neck_n1_link">
+    <inertial>
+      <origin
+        xyz="0.0056163 -0.068891 -0.01248"
+        rpy="0 0 0" />
+      <mass
+        value="0.24777" />
+      <inertia
+        ixx="0.00028574"
+        ixy="2.0669E-05"
+        ixz="3.0466E-06"
+        iyy="0.00011057"
+        iyz="-4.8832E-05"
+        izz="0.00027429" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/neck_n1_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/neck_n1_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="neck_n1_joint"
+    type="revolute">
+    <origin
+      xyz="-0.0742166695062486 0.0150861728537563 0.0205492071458914"
+      rpy="-1.5707963267949 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="neck_n1_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-1.065"
+      upper="0.436"
+      effort="100"
+      velocity="6" />
+  </joint>
+  <link
+    name="neck_n2_link">
+    <inertial>
+      <origin
+        xyz="0.042035 0.0075777 -0.027871"
+        rpy="0 0 0" />
+      <mass
+        value="0.10044" />
+      <inertia
+        ixx="4.8276E-05"
+        ixy="-1.6348E-05"
+        ixz="2.0417E-06"
+        iyy="9.9239E-05"
+        iyz="4.2677E-07"
+        izz="9.0874E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/neck_n2_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/neck_n2_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="neck_n2_joint"
+    type="revolute">
+    <origin
+      xyz="0.030476 -0.1167 -0.0447"
+      rpy="3.1416 0 -1.0472" />
+    <parent
+      link="neck_n1_link" />
+    <child
+      link="neck_n2_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-0.698"
+      upper="1.326"
+      effort="100"
+      velocity="6" />
+  </joint>
+  <link
+    name="neck_n3_link">
+    <inertial>
+      <origin
+        xyz="-0.016589 -2.7487E-06 -0.020892"
+        rpy="0 0 0" />
+      <mass
+        value="0.1462" />
+      <inertia
+        ixx="9.3798E-05"
+        ixy="1.3534E-08"
+        ixz="-7.699E-08"
+        iyy="9.1184E-05"
+        iyz="-2.1794E-10"
+        izz="0.00016521" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/neck_n3_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.75294 0.75294 0.75294 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/neck_n3_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="neck_n3_joint"
+    type="revolute">
+    <origin
+      xyz="0.0304840942132121 0.0176000000000001 -0.0283000000000009"
+      rpy="1.5707963267949 0 -1.0471975511966" />
+    <parent
+      link="neck_n2_link" />
+    <child
+      link="neck_n3_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-1.571"
+      upper="1.571"
+      effort="100"
+      velocity="6" />
+  </joint>
+  <link
+    name="neck_n4_link">
+    <inertial>
+      <origin
+        xyz="0.00090398 0.010912 -0.10923"
+        rpy="0 0 0" />
+      <mass
+        value="1.0461" />
+      <inertia
+        ixx="0.0046317"
+        ixy="-2.0087E-06"
+        ixz="2.4263E-05"
+        iyy="0.009285"
+        iyz="-0.0001835"
+        izz="0.0050467" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/neck_n4_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.75294 0.75294 0.75294 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/neck_n4_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="neck_n4_joint"
+    type="revolute">
+    <origin
+      xyz="-0.111550000000001 0 -0.0157999999999999"
+      rpy="-1.5707963267949 0 1.57079632679489" />
+    <parent
+      link="neck_n3_link" />
+    <child
+      link="neck_n4_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-0.785"
+      upper="0.785"
+      effort="100"
+      velocity="6" />
+  </joint>
+  <link
+    name="imu_link">
+    <inertial>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <mass
+        value="0" />
+      <inertia
+        ixx="0"
+        ixy="0"
+        ixz="0"
+        iyy="0"
+        iyz="0"
+        izz="0" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/imu_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://ocean_description/meshes/imu_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="imu_joint"
+    type="fixed">
+    <origin
+      xyz="-0.0247152340596654 -0.000913827699595732 -0.1587"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="imu_link" />
+    <axis
+      xyz="0 0 0" />
+    <limit
+      lower="-3.14"
+      upper="3.14"
+      effort="1"
+      velocity="1" />
+  </joint>
+</robot>

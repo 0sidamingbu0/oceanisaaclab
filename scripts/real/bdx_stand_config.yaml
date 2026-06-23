@@ -1,0 +1,37 @@
+policy:
+  path: "logs/rsl_rl/bdx_stand_direct/latest/exported/policy.pt"
+  inference_hz: 58
+  control_hz: 116
+  action_scale: 0.25
+  ang_vel_scale: 0.25
+  dof_pos_scale: 1.0
+  dof_vel_scale: 0.05
+  commands_scale: [2.0, 2.0, 0.25]
+
+safety:
+  max_roll_pitch_rad: 0.65
+  command_timeout_s: 0.08
+  action_rate_limit_rad_per_s: 1.2
+  warmup_s: 4.0
+
+imu:
+  type: "YIS320"
+  frame: "base_link"
+
+buses:
+  right_leg:
+    name: "rs485_right"
+    joints:
+      - {name: "leg_r1_joint", motor_id: 1, direction: 1.0, zero_offset: 0.0, lower: -0.436, upper: 0.349, kp: 18.0, kd: 0.8}
+      - {name: "leg_r2_joint", motor_id: 2, direction: 1.0, zero_offset: 0.0, lower: -0.750, upper: 0.262, kp: 18.0, kd: 0.8}
+      - {name: "leg_r3_joint", motor_id: 3, direction: 1.0, zero_offset: 0.0, lower: -1.361, upper: 0.489, kp: 22.0, kd: 1.0}
+      - {name: "leg_r4_joint", motor_id: 4, direction: 1.0, zero_offset: 0.0, lower: -0.803, upper: 1.344, kp: 22.0, kd: 1.0}
+      - {name: "leg_r5_joint", motor_id: 5, direction: 1.0, zero_offset: 0.0, lower: -1.396, upper: 1.134, kp: 16.0, kd: 0.7}
+  left_leg:
+    name: "rs485_left"
+    joints:
+      - {name: "leg_l1_joint", motor_id: 1, direction: 1.0, zero_offset: 0.0, lower: -0.349, upper: 0.436, kp: 18.0, kd: 0.8}
+      - {name: "leg_l2_joint", motor_id: 2, direction: 1.0, zero_offset: 0.0, lower: -0.262, upper: 0.750, kp: 18.0, kd: 0.8}
+      - {name: "leg_l3_joint", motor_id: 3, direction: 1.0, zero_offset: 0.0, lower: -0.489, upper: 1.361, kp: 22.0, kd: 1.0}
+      - {name: "leg_l4_joint", motor_id: 4, direction: 1.0, zero_offset: 0.0, lower: -1.344, upper: 0.803, kp: 22.0, kd: 1.0}
+      - {name: "leg_l5_joint", motor_id: 5, direction: 1.0, zero_offset: 0.0, lower: -1.134, upper: 1.396, kp: 16.0, kd: 0.7}

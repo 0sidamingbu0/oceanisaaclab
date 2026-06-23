@@ -13,6 +13,16 @@ from . import agents
 
 
 gym.register(
+    id="Ocean-BDX-Stand-Direct-v0",
+    entry_point=f"{__name__}.oceanisaaclab_env:OceanisaaclabEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.oceanisaaclab_env_cfg:OceanisaaclabEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+    },
+)
+
+gym.register(
     id="Template-Oceanisaaclab-Direct-v0",
     entry_point=f"{__name__}.oceanisaaclab_env:OceanisaaclabEnv",
     disable_env_checker=True,
