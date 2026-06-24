@@ -28,12 +28,14 @@ Ocean-BDX-Stand-Direct-v0
 ```text
 logs/rsl_rl/bdx_stand_direct/<run>/exported/policy.pt
 logs/rsl_rl/bdx_stand_direct/<run>/exported/policy.onnx
+logs/rsl_rl/bdx_stand_direct/<run>/exported/policy.onnx.data
 ```
 
-迁移到 `/home/ocean/oceanbdx` 时，将 `policy.onnx` 放到：
+迁移到 `/home/ocean/oceanbdx` 时，将 `policy.onnx` 和 `policy.onnx.data` 一起放到：
 
 ```text
 /home/ocean/oceanbdx/policy/policy.onnx
+/home/ocean/oceanbdx/policy/policy.onnx.data
 ```
 
 ## 机器人与关节约定
@@ -102,6 +104,14 @@ target_q = 0.25 * action
 
 部署侧仍建议保留软限位裁剪和动作变化率限制。
 
+`/home/ocean/oceanbdx/config/oceanbdx.yaml` 中应保持：
+
+```text
+policy.clip_actions = 1.0
+```
+
+训练环境会在 `_pre_physics_step()` 中将策略输出裁剪到 `[-1, 1]`。如果 sim2sim 或实机侧把 `clip_actions` 放大到 `100`，策略目标角会跑出训练分布，常见表现是无外力也站不稳、持续小碎步或向一侧倾倒。
+
 ## 控制参数
 
 Isaac Lab 训练配置中腿部 actuator 初值：
@@ -157,7 +167,7 @@ policy step = 60 Hz
 1. 实机主循环 116 Hz，策略每 2 个周期运行一次，约 58 Hz。最接近当前训练的 60 Hz。
 2. 若要策略 116 Hz，训练侧应把 `decimation` 或 `sim.dt` 同步调整后重新训练。
 
-`/home/ocean/oceanbdx/config/oceanbdx.yaml` 目前仍写着 `dt=0.005, decimation=4`，即 200 Hz 主循环、50 Hz 策略。迁移本策略时需要按实际 116 Hz 总线能力更新该配置。
+`/home/ocean/oceanbdx/config/oceanbdx.yaml` 的 sim2sim 推荐先用 `dt=0.005, decimation=3`，即 200 Hz 主循环、约 66.7 Hz 策略，接近训练的 60 Hz。若后续对齐真机 116 Hz 总线，推荐主循环 116 Hz、策略每 2 个周期运行一次，约 58 Hz。
 
 ## 训练文件
 
@@ -178,10 +188,11 @@ source/oceanisaaclab/oceanisaaclab/tasks/direct/oceanisaaclab/__init__.py
 2. `policy.num_obs` 应为 39，或保持 `0` 自动推断为 `9 + 3 * num_joints`。
 3. `default_dof_pos` 为全 0。
 4. `action_scale = 0.25`。
-5. `ang_vel_scale = 0.25`，`dof_pos_scale = 1.0`，`dof_vel_scale = 0.05`。
-6. `commands_scale = [2.0, 2.0, 0.25]`。
-7. IMU 四元数顺序和坐标系已对齐 base_link。
-8. 真机先吊起或支撑测试，确认 10 个关节目标方向正确后再落地。
+5. `clip_actions = 1.0`。
+6. `ang_vel_scale = 0.25`，`dof_pos_scale = 1.0`，`dof_vel_scale = 0.05`。
+7. `commands_scale = [2.0, 2.0, 0.25]`。
+8. IMU 四元数顺序和坐标系已对齐 base_link。
+9. 真机先吊起或支撑测试，确认 10 个关节目标方向正确后再落地。
 
 ## 后续低速行走扩展
 

@@ -78,6 +78,12 @@ parser.add_argument(
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 parser.add_argument("--external_callback", default=None, help="Fully qualified path to an externally defined callback.")
+parser.add_argument(
+    "--debug_policy_steps",
+    type=int,
+    default=0,
+    help="Print policy obs/action/target diagnostics for the first N play steps, then exit.",
+)
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
 args_cli, remaining_args = setup_preset_cli(parser)
@@ -225,6 +231,33 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 with torch.inference_mode():
                     # agent stepping
                     actions = policy(obs)
+                    if args_cli.debug_policy_steps and timestep < args_cli.debug_policy_steps:
+                        env_unwrapped = env.unwrapped
+                        action0 = actions[0].detach().cpu()
+                        obs0 = obs[0].detach().cpu() if isinstance(obs, torch.Tensor) else obs["policy"][0].detach().cpu()
+                        clipped0 = action0.clamp(-1.0, 1.0)
+                        leg_ids = getattr(env_unwrapped, "_leg_dof_idx", None)
+                        if leg_ids is not None:
+                            joint_names = [env_unwrapped.robot.joint_names[i] for i in leg_ids]
+                            q0 = env_unwrapped.robot.data.joint_pos.torch[0, leg_ids].detach().cpu()
+                            dq0 = env_unwrapped.robot.data.joint_vel.torch[0, leg_ids].detach().cpu()
+                            default0 = env_unwrapped._default_leg_joint_pos[0].detach().cpu()
+                            target0 = default0 + env_unwrapped.cfg.action_scale * clipped0
+                            print(f"[debug_play] step={timestep} joint_names={joint_names}")
+                            print(
+                                "[debug_play] "
+                                f"q={q0.numpy().round(3).tolist()} "
+                                f"dq={dq0.numpy().round(3).tolist()} "
+                                f"action={action0.numpy().round(3).tolist()} "
+                                f"target={target0.numpy().round(3).tolist()}"
+                            )
+                        print(
+                            "[debug_play] "
+                            f"obs_first9={obs0[:9].numpy().round(3).tolist()} "
+                            f"action_absmax={float(action0.abs().max()):.3f} "
+                            f"clipped_absmax={float(clipped0.abs().max()):.3f} "
+                            f"sat_count={int((clipped0.abs() > 0.98).sum())}/{clipped0.numel()}"
+                        )
                     # env stepping
                     obs, _, dones, _ = env.step(actions)
                     # reset recurrent states for episodes that have terminated
@@ -235,6 +268,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if args_cli.video:
                     timestep += 1
                     if timestep == args_cli.video_length:
+                        break
+                elif args_cli.debug_policy_steps:
+                    timestep += 1
+                    if timestep >= args_cli.debug_policy_steps:
                         break
 
                 sleep_time = dt - (time.time() - start_time)

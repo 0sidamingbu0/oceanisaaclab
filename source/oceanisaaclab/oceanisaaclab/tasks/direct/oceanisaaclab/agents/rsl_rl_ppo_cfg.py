@@ -11,7 +11,7 @@ from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPp
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    max_iterations = 2000
+    max_iterations = 10000
     save_interval = 100
     experiment_name = "bdx_stand_direct"
     actor = RslRlMLPModelCfg(
