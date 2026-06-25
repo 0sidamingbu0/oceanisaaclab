@@ -84,6 +84,16 @@ parser.add_argument(
     default=0,
     help="Print policy obs/action/target diagnostics for the first N play steps, then exit.",
 )
+parser.add_argument(
+    "--debug_push_steps",
+    type=int,
+    default=0,
+    help="Run a deterministic play push test for N steps, print push/base/joint diagnostics, then exit.",
+)
+parser.add_argument("--debug_push_start", type=int, default=80, help="Step at which the debug push starts.")
+parser.add_argument("--debug_push_duration", type=int, default=18, help="Debug push duration in policy steps.")
+parser.add_argument("--debug_push_force_x", type=float, default=0.0, help="Debug push force X in world frame [N].")
+parser.add_argument("--debug_push_force_y", type=float, default=60.0, help="Debug push force Y in world frame [N].")
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
 args_cli, remaining_args = setup_preset_cli(parser)
@@ -173,6 +183,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         # wrap around environment for rsl-rl
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+        if args_cli.debug_push_steps:
+            env.unwrapped.cfg.enable_random_push = False
 
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
@@ -220,6 +232,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         dt = env.unwrapped.step_dt
 
+        foot_body_ids = []
+        foot_body_names = []
+        if args_cli.debug_push_steps:
+            for body_id, body_name in enumerate(env.unwrapped.robot.body_names):
+                body_name_lower = body_name.lower()
+                if (
+                    "foot" in body_name_lower
+                    or "ankle" in body_name_lower
+                    or body_name_lower.endswith("leg_r5_link")
+                    or body_name_lower.endswith("leg_l5_link")
+                ):
+                    foot_body_ids.append(body_id)
+                    foot_body_names.append(body_name)
+            print(
+                "[debug_push] "
+                f"force_w=[{args_cli.debug_push_force_x:.1f},{args_cli.debug_push_force_y:.1f},0.0]N "
+                f"start={args_cli.debug_push_start} duration={args_cli.debug_push_duration} "
+                f"foot_bodies={foot_body_names}"
+            )
+
         # reset environment
         obs = env.get_observations()
         timestep = 0
@@ -231,6 +263,57 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 with torch.inference_mode():
                     # agent stepping
                     actions = policy(obs)
+                    if args_cli.debug_push_steps:
+                        env_unwrapped = env.unwrapped
+                        push_active = (
+                            args_cli.debug_push_start
+                            <= timestep
+                            < args_cli.debug_push_start + args_cli.debug_push_duration
+                        )
+                        push_forces = torch.zeros_like(env_unwrapped._push_forces)
+                        push_torques = torch.zeros_like(env_unwrapped._push_torques)
+                        if push_active:
+                            push_forces[:, 0, 0] = args_cli.debug_push_force_x
+                            push_forces[:, 0, 1] = args_cli.debug_push_force_y
+                        env_unwrapped.robot.permanent_wrench_composer.set_forces_and_torques(
+                            push_forces,
+                            push_torques,
+                            body_ids=env_unwrapped._base_body_id,
+                            is_global=True,
+                        )
+                        should_print = push_active or timestep % 10 == 0
+                        if should_print:
+                            leg_ids = env_unwrapped._leg_dof_idx
+                            q0 = env_unwrapped.robot.data.joint_pos.torch[0, leg_ids].detach().cpu()
+                            dq0 = env_unwrapped.robot.data.joint_vel.torch[0, leg_ids].detach().cpu()
+                            action0 = actions[0].detach().cpu()
+                            clipped0 = action0.clamp(-1.0, 1.0)
+                            target0 = (
+                                env_unwrapped._default_leg_joint_pos[0].detach().cpu()
+                                + env_unwrapped.cfg.action_scale * clipped0
+                            )
+                            root_pos = env_unwrapped.robot.data.root_pos_w.torch[0].detach().cpu()
+                            root_lin_vel_b = env_unwrapped.robot.data.root_lin_vel_b.torch[0].detach().cpu()
+                            root_ang_vel_b = env_unwrapped.robot.data.root_ang_vel_b.torch[0].detach().cpu()
+                            gravity_b = env_unwrapped.robot.data.projected_gravity_b.torch[0].detach().cpu()
+                            foot_z_text = ""
+                            if foot_body_ids:
+                                body_pos = env_unwrapped.robot.data.body_pos_w.torch[0, foot_body_ids, 2].detach().cpu()
+                                foot_z_text = f" foot_z={body_pos.numpy().round(3).tolist()}"
+                            print(
+                                "[debug_push] "
+                                f"step={timestep} active={int(push_active)} "
+                                f"force_w=[{push_forces[0, 0, 0].item():+.1f},{push_forces[0, 0, 1].item():+.1f},0.0] "
+                                f"base_pos={root_pos.numpy().round(3).tolist()} "
+                                f"lin_vel_b={root_lin_vel_b.numpy().round(3).tolist()} "
+                                f"ang_vel_b={root_ang_vel_b.numpy().round(3).tolist()} "
+                                f"grav_b={gravity_b.numpy().round(3).tolist()} "
+                                f"q={q0.numpy().round(3).tolist()} "
+                                f"dq={dq0.numpy().round(3).tolist()} "
+                                f"action={action0.numpy().round(3).tolist()} "
+                                f"target={target0.numpy().round(3).tolist()}"
+                                f"{foot_z_text}"
+                            )
                     if args_cli.debug_policy_steps and timestep < args_cli.debug_policy_steps:
                         env_unwrapped = env.unwrapped
                         action0 = actions[0].detach().cpu()
@@ -272,6 +355,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 elif args_cli.debug_policy_steps:
                     timestep += 1
                     if timestep >= args_cli.debug_policy_steps:
+                        break
+                elif args_cli.debug_push_steps:
+                    timestep += 1
+                    if timestep >= args_cli.debug_push_steps:
                         break
 
                 sleep_time = dt - (time.time() - start_time)

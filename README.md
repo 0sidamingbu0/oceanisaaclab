@@ -12,6 +12,14 @@ It allows you to develop in an isolated environment, outside of the core Isaac L
 
 **Keywords:** extension, template, isaaclab
 
+## Changelog / 修改记录
+
+每天的修改记录统一放在 [`changelog/`](changelog/) 文件夹中，按日期命名（`YYYY-MM-DD.md`，如 [`changelog/2026-06-25.md`](changelog/2026-06-25.md)）。
+
+目的：记录每天改了什么、为什么改、改动效果如何，便于理解工程的历史上下文，也方便其他工程师快速了解本工程的演进履历。
+
+每个日志建议包含：改动背景与动机、涉及文件、具体改动、验证方式、训练/实验观察、待办与建议。
+
 ## Installation
 
 - Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
@@ -44,7 +52,15 @@ It allows you to develop in an isolated environment, outside of the core Isaac L
         # python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
         _isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py --task=Template-Oceanisaaclab-Direct-v0 --viz kit
         ```
-
+    - Tensorboard:
+        ```bash
+        ./_isaaclab/isaaclab.sh -p -m tensorboard.main --logdir=logs
+        http://localhost:6006/
+        ```
+    - play:
+        ```bash
+        ./_isaaclab/isaaclab.sh -p scripts/rsl_rl/play.py --task Ocean-BDX-Stand-Direct-v0 --num_envs 16 --viz kit --checkpoint /home/ocean/oceanisaaclab/oceanisaaclab/logs/rsl_rl/bdx_stand_direct/2026-06-24_10-22-28/model_6700.pt
+        ```
     - Running a task with dummy agents:
 
         These include dummy agents that output zero or random agents. They are useful to ensure that the environments are configured correctly.
