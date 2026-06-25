@@ -71,6 +71,7 @@ class OceanisaaclabEnv(DirectRLEnv):
                 "feet_air_time",
                 "feet_slide",
                 "stand_still",
+                "contact_force_rate",
             ]
         }
 
@@ -231,6 +232,12 @@ class OceanisaaclabEnv(DirectRLEnv):
         in_contact = contact_time > 0.0
         # foot horizontal velocity (articulation index space, aligned order)
         feet_lin_vel = self.robot.data.body_lin_vel_w.torch[:, self._feet_body_ids, :2]
+        # contact-force rate: norm of frame-to-frame change in foot contact force.
+        # history shape (N, T, num_sensors, 3); penalizing this directly damps the
+        # rapid force jumps that cause sim2real standing jitter/oscillation.
+        force_hist = self.contact_sensor.data.net_forces_w_history.torch[:, :, self._feet_contact_ids, :]
+        force_diff = force_hist[:, :-1] - force_hist[:, 1:]
+        contact_force_rate = torch.sum(torch.norm(force_diff, dim=-1), dim=(1, 2))
 
         total_reward, reward_terms = compute_rewards(
             self.cfg.rew_scale_alive,
@@ -246,6 +253,7 @@ class OceanisaaclabEnv(DirectRLEnv):
             self.cfg.rew_scale_feet_air_time,
             self.cfg.rew_scale_feet_slide,
             self.cfg.rew_scale_stand_still,
+            self.cfg.rew_scale_contact_force_rate,
             self.cfg.target_base_height,
             self.cfg.air_time_target,
             self.cfg.lin_vel_track_sigma,
@@ -263,6 +271,7 @@ class OceanisaaclabEnv(DirectRLEnv):
             first_contact,
             in_contact,
             feet_lin_vel,
+            contact_force_rate,
             self.reset_terminated,
         )
         for key, value in reward_terms.items():
@@ -365,6 +374,7 @@ def compute_rewards(
     rew_scale_feet_air_time: float,
     rew_scale_feet_slide: float,
     rew_scale_stand_still: float,
+    rew_scale_contact_force_rate: float,
     target_base_height: float,
     air_time_target: float,
     lin_vel_track_sigma: float,
@@ -382,6 +392,7 @@ def compute_rewards(
     first_contact: torch.Tensor,
     in_contact: torch.Tensor,
     feet_lin_vel: torch.Tensor,
+    contact_force_rate: torch.Tensor,
     reset_terminated: torch.Tensor,
 ):
     is_walking = (~is_standing).float()
@@ -411,6 +422,9 @@ def compute_rewards(
     # standing envs: penalize any foot motion to hold still
     foot_speed_sq = torch.sum(torch.sum(torch.square(feet_lin_vel), dim=2), dim=1)
     rew_stand_still = rew_scale_stand_still * foot_speed_sq * is_standing.float()
+    # penalize rapid contact-force changes (anti-jitter: damps force spikes that cause
+    # sim2real standing oscillation)
+    rew_contact_force_rate = rew_scale_contact_force_rate * contact_force_rate
     total_reward = (
         rew_alive
         + rew_termination
@@ -425,6 +439,7 @@ def compute_rewards(
         + rew_feet_air_time
         + rew_feet_slide
         + rew_stand_still
+        + rew_contact_force_rate
     )
     reward_terms = {
         "alive": rew_alive,
@@ -440,5 +455,6 @@ def compute_rewards(
         "feet_air_time": rew_feet_air_time,
         "feet_slide": rew_feet_slide,
         "stand_still": rew_stand_still,
+        "contact_force_rate": rew_contact_force_rate,
     }
     return total_reward, reward_terms

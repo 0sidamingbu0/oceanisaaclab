@@ -121,23 +121,24 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     command_scale = (2.0, 2.0, 0.25)
     # - velocity command sampling (walking task)
     command_vx_range = (-0.3, 0.8)  # [m/s]  前进为主，允许少量后退
-    stand_still_prob = 0.2  # 该比例的 env 采样零速度指令，保留站立能力
-    air_time_target = 0.3  # [s]  feet air time 奖励的目标腾空时长
+    stand_still_prob = 1.0  # 纯站立版：所有 env 零速度指令（站稳不抖优先，sim2real 调通）
+    air_time_target = 0.4  # [s]  feet air time 奖励的目标腾空时长
     lin_vel_track_sigma = 0.25  # vx 跟踪奖励的 exp 带宽
     # - reward scales
     rew_scale_alive = 1.0
     rew_scale_terminated = -5.0
     rew_scale_upright = 2.0
     rew_scale_height = 1.0
-    rew_scale_ang_vel = -0.05  # 仅惩罚 roll/pitch 角速度（机身平稳）
-    rew_scale_track_lin_vel = 1.5  # vx 指令跟踪（行走核心驱动，正号）
-    rew_scale_lateral = -0.5  # 惩罚非指令的侧移 vy 和自转 yaw
+    rew_scale_ang_vel = -0.1  # 惩罚 roll/pitch 角速度（机身平稳），站立版加大
+    rew_scale_track_lin_vel = 1.5  # vx 指令跟踪（站立版即奖励速度≈0，正号）
+    rew_scale_lateral = -1.0  # 惩罚非指令的侧移 vy 和自转 yaw（站立版加大防漂移）
     rew_scale_joint_pos = -0.08
-    rew_scale_joint_vel = -0.005
-    rew_scale_action_rate = -0.02  # 加大以抑制高频抖动（原 -0.01）
-    rew_scale_feet_air_time = 1.0  # 拉长腾空时长、降低步频（仅非站立 env）
-    rew_scale_feet_slide = -0.1  # 接地时惩罚水平滑移
-    rew_scale_stand_still = -0.5  # 站立 env 惩罚脚移动
+    rew_scale_joint_vel = -0.02  # 站立版加大，抑制关节微动抖
+    rew_scale_action_rate = -0.1  # 加大平滑电机指令（站立版，直击真机高频抖动根源）
+    rew_scale_feet_air_time = 0.0  # 纯站立版关闭抬脚奖励（不鼓励迈步）
+    rew_scale_feet_slide = -1.0  # 接地时惩罚水平滑移（站立版加大防漂移）
+    rew_scale_stand_still = -2.0  # 站立 env 惩罚脚移动（站立版核心，加大）
+    rew_scale_contact_force_rate = -3.0e-3  # 惩罚接触力跳变（抗抖核心）；实测原项~44/步，×此权重≈-0.13/步，与其他惩罚可比
     # - observation noise (gaussian std, applied on raw physical units before scaling)
     enable_obs_noise = True
     noise_ang_vel = 0.03  # [rad/s]  静置实测 ~0.003，留余量覆盖运动振动
@@ -154,6 +155,6 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     min_upright_projection = 0.65
     # - random lateral push disturbance
     enable_random_push = True
-    push_force_range = (35.0, 65.0)  # [N]
+    push_force_range = (20.0, 40.0)  # [N]  对 ~10kg 小机器人降低推力，站立更易收敛仍保留抗扰
     push_duration_s = 0.18
     push_interval_s = (1.0, 2.0)
