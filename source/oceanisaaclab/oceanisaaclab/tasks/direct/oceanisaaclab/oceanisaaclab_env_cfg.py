@@ -122,8 +122,15 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     # - velocity command sampling (walking task)
     command_vx_range = (-0.3, 0.8)  # [m/s]  前进为主，允许少量后退
     stand_still_prob = 1.0  # 纯站立版：所有 env 零速度指令（站稳不抖优先，sim2real 调通）
-    air_time_target = 0.4  # [s]  feet air time 奖励的目标腾空时长
+    air_time_target = 0.15  # [s]  feet air time 奖励的目标腾空时长。推力恢复是急促碎步(腾空~0.1-0.25s)，
+    #                                旧值 0.4 使任何恢复步 (air_time-target)<0 → 迈步反被惩罚、策略宁可顶住或摔。
     lin_vel_track_sigma = 0.25  # vx 跟踪奖励的 exp 带宽
+    # - push-recovery via stepping (instability-gated, IMU-observable signals only)
+    #   失衡度 = sigmoid 组合躯干倾斜 |proj_g_xy| 与倾倒角速度 |ang_vel_xy|（真机 IMU 均可得）；
+    #   稳态≈0 时迈步惩罚全开（钉地不抖），失衡≈1 时解除迈步惩罚并奖励有效迈步。
+    instability_tilt_thresh = 0.15  # |proj_g_xy| 阈值（约 8.6°）：超过视为开始失衡
+    instability_tilt_rate_thresh = 1.0  # |ang_vel_xy| 阈值 [rad/s]：倾倒角速度
+    instability_sharpness = 8.0  # sigmoid 陡度（越大越接近硬阈值）
     # - reward scales
     rew_scale_alive = 1.0
     rew_scale_terminated = -5.0
@@ -135,9 +142,10 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     rew_scale_joint_pos = -0.08
     rew_scale_joint_vel = -0.02  # 站立版加大，抑制关节微动抖
     rew_scale_action_rate = -0.1  # 加大平滑电机指令（站立版，直击真机高频抖动根源）
-    rew_scale_feet_air_time = 0.0  # 纯站立版关闭抬脚奖励（不鼓励迈步）
-    rew_scale_feet_slide = -1.0  # 接地时惩罚水平滑移（站立版加大防漂移）
-    rew_scale_stand_still = -2.0  # 站立 env 惩罚脚移动（站立版核心，加大）
+    rew_scale_feet_air_time = 2.0  # 失衡时奖励有效迈步（× instability 门控；稳态不鼓励迈步）。
+    #                                 加大以盖过迈步时产生的 joint_vel/action_rate/contact_force_rate 等平滑惩罚。
+    rew_scale_feet_slide = -1.0  # 接地滑移惩罚（× (1-instability)：稳态防漂移，失衡时放行迈步）
+    rew_scale_stand_still = -2.0  # 脚移动惩罚（× (1-instability)：稳态钉地，失衡时解除以允许迈步恢复）
     rew_scale_contact_force_rate = -3.0e-3  # 惩罚接触力跳变（抗抖核心）；实测原项~44/步，×此权重≈-0.13/步，与其他惩罚可比
     # - observation noise (gaussian std, applied on raw physical units before scaling)
     enable_obs_noise = True
@@ -155,6 +163,13 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     min_upright_projection = 0.65
     # - random lateral push disturbance
     enable_random_push = True
-    push_force_range = (20.0, 40.0)  # [N]  对 ~10kg 小机器人降低推力，站立更易收敛仍保留抗扰
+    push_force_range = (20.0, 40.0)  # [N]  课程起点（继承站立版），随训练线性升到 push_force_range_max
     push_duration_s = 0.18
     push_interval_s = (1.0, 2.0)
+    # - push curriculum: ramp push magnitude up over training to force stepping recovery
+    enable_push_curriculum = True
+    push_force_range_max = (45.0, 90.0)  # [N]  课程终点：足以把质心推出支撑面、逼出迈步
+    # common_step_counter 每个控制步 +1（不乘 num_envs！）→ 1 iter = num_steps_per_env(24) 步。
+    # 旧值 250_000_000 误按乘了 num_envs(4096) 估，导致 7999 iter 时 frac≈0.0008，推力全程卡在起点
+    # (20,40)N 从未逼出迈步。60_000 ≈ 2500 iter 跑满课程。
+    push_curriculum_steps = 60_000  # 在多少 common_step 内从起点线性升到终点（= 跑满课程的 iter 数 × 24）

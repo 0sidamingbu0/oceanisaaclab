@@ -162,6 +162,21 @@ class OceanisaaclabEnv(DirectRLEnv):
         self.robot.set_joint_position_target_index(target=self._processed_actions, joint_ids=self._leg_dof_idx)
         self.robot.set_joint_position_target_index(target=self._default_neck_joint_pos, joint_ids=self._neck_dof_idx)
 
+    def _current_push_force_range(self) -> tuple[float, float]:
+        """Push magnitude range, linearly ramped over training (curriculum).
+
+        Ramps from cfg.push_force_range to cfg.push_force_range_max across
+        cfg.push_curriculum_steps common steps. On resume the counter restarts
+        from 0, so the ramp re-runs from the start range — intended, so the
+        recovered policy re-eases into larger pushes rather than being slammed.
+        """
+        lo, hi = self.cfg.push_force_range
+        if not self.cfg.enable_push_curriculum:
+            return lo, hi
+        hi_lo, hi_hi = self.cfg.push_force_range_max
+        frac = min(1.0, self.common_step_counter / float(self.cfg.push_curriculum_steps))
+        return lo + (hi_lo - lo) * frac, hi + (hi_hi - hi) * frac
+
     def _update_random_pushes(self) -> None:
         if not self.cfg.enable_random_push:
             return
@@ -172,12 +187,8 @@ class OceanisaaclabEnv(DirectRLEnv):
         if torch.any(start_push):
             env_ids = torch.nonzero(start_push, as_tuple=False).squeeze(-1)
             angles = torch.rand(len(env_ids), device=self.device) * 2.0 * torch.pi
-            magnitudes = sample_uniform(
-                self.cfg.push_force_range[0],
-                self.cfg.push_force_range[1],
-                (len(env_ids),),
-                self.device,
-            )
+            lo, hi = self._current_push_force_range()
+            magnitudes = sample_uniform(lo, hi, (len(env_ids),), self.device)
             self._push_forces[env_ids, 0, 0] = magnitudes * torch.cos(angles)
             self._push_forces[env_ids, 0, 1] = magnitudes * torch.sin(angles)
             self._push_forces[env_ids, 0, 2] = 0.0
@@ -239,6 +250,19 @@ class OceanisaaclabEnv(DirectRLEnv):
         force_diff = force_hist[:, :-1] - force_hist[:, 1:]
         contact_force_rate = torch.sum(torch.norm(force_diff, dim=-1), dim=(1, 2))
 
+        # instability gate (IMU-observable only): torso tilt |proj_g_xy| + tilt-rate |ang_vel_xy|.
+        # 0 in steady stance (stepping penalized → planted feet), ->1 when pushed off balance
+        # (stepping penalty lifted → free to step and recover). No privileged push signal.
+        proj_g = self.robot.data.projected_gravity_b.torch
+        ang_vel = self.robot.data.root_ang_vel_b.torch
+        tilt = torch.norm(proj_g[:, :2], dim=1)
+        tilt_rate = torch.norm(ang_vel[:, :2], dim=1)
+        gate_arg = (
+            (tilt - self.cfg.instability_tilt_thresh) / self.cfg.instability_tilt_thresh
+            + (tilt_rate - self.cfg.instability_tilt_rate_thresh) / self.cfg.instability_tilt_rate_thresh
+        )
+        instability = torch.sigmoid(self.cfg.instability_sharpness * gate_arg)
+
         total_reward, reward_terms = compute_rewards(
             self.cfg.rew_scale_alive,
             self.cfg.rew_scale_terminated,
@@ -259,7 +283,7 @@ class OceanisaaclabEnv(DirectRLEnv):
             self.cfg.lin_vel_track_sigma,
             self.robot.data.root_pos_w.torch[:, 2],
             self._commands,
-            self._is_standing,
+            instability,
             self.robot.data.root_lin_vel_b.torch,
             self.robot.data.projected_gravity_b.torch,
             self.robot.data.root_ang_vel_b.torch,
@@ -380,7 +404,7 @@ def compute_rewards(
     lin_vel_track_sigma: float,
     base_height: torch.Tensor,
     commands: torch.Tensor,
-    is_standing: torch.Tensor,
+    instability: torch.Tensor,
     root_lin_vel_b: torch.Tensor,
     projected_gravity_b: torch.Tensor,
     root_ang_vel_b: torch.Tensor,
@@ -395,7 +419,9 @@ def compute_rewards(
     contact_force_rate: torch.Tensor,
     reset_terminated: torch.Tensor,
 ):
-    is_walking = (~is_standing).float()
+    # instability in [0,1]: 0 steady stance, 1 pushed off balance.
+    # stepping penalties scale with stability (1-instability); stepping reward with instability.
+    stability = 1.0 - instability
 
     rew_alive = rew_scale_alive * (1.0 - reset_terminated.float())
     rew_termination = rew_scale_terminated * reset_terminated.float()
@@ -413,15 +439,15 @@ def compute_rewards(
     rew_joint_pos = rew_scale_joint_pos * torch.sum(torch.square(joint_pos_error), dim=1)
     rew_joint_vel = rew_scale_joint_vel * torch.sum(torch.square(joint_vel), dim=1)
     rew_action_rate = rew_scale_action_rate * torch.sum(torch.square(actions - previous_actions), dim=1)
-    # feet air time: reward time off the ground at each touchdown (walking envs only)
+    # feet air time: reward effective stepping ONLY when off balance (gated by instability)
     air_time_reward = torch.sum((air_time - air_time_target) * first_contact.float(), dim=1)
-    rew_feet_air_time = rew_scale_feet_air_time * air_time_reward * is_walking
-    # penalize horizontal foot slip while in contact
+    rew_feet_air_time = rew_scale_feet_air_time * air_time_reward * instability
+    # penalize horizontal foot slip — only while stable (lifted when stepping to recover)
     slide = torch.sum(torch.sum(torch.square(feet_lin_vel), dim=2) * in_contact.float(), dim=1)
-    rew_feet_slide = rew_scale_feet_slide * slide
-    # standing envs: penalize any foot motion to hold still
+    rew_feet_slide = rew_scale_feet_slide * slide * stability
+    # penalize any foot motion to hold still — only while stable (lifted when off balance)
     foot_speed_sq = torch.sum(torch.sum(torch.square(feet_lin_vel), dim=2), dim=1)
-    rew_stand_still = rew_scale_stand_still * foot_speed_sq * is_standing.float()
+    rew_stand_still = rew_scale_stand_still * foot_speed_sq * stability
     # penalize rapid contact-force changes (anti-jitter: damps force spikes that cause
     # sim2real standing oscillation)
     rew_contact_force_rate = rew_scale_contact_force_rate * contact_force_rate
