@@ -63,20 +63,21 @@ default_dof_pos = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
 ## 观测格式
 
-策略观测为 39 维，顺序与 `/home/ocean/oceanbdx/sim2sim/mujoco_sim.py` 的 `Policy.step()` 对齐：
+站立旧版策略观测为 39 维。当前低速行走 v2 策略观测为 41 维，在 `command` 后增加 gait clock：
 
 ```text
 obs = [
   base_ang_vel * 0.25,               # 3, body frame gyro, rad/s
   projected_gravity,                 # 3, quat_rotate_inverse(q, [0, 0, -1])
-  command * [2.0, 2.0, 0.25],        # 3, [vx, vy, wz]
+  command * [2.0, 2.0, 1.0],         # 3, [vx, vy, wz]
+  [sin(gait_phase), cos(gait_phase)], # 2, gait_phase cycles with gait_cycle_period
   (joint_pos - default_dof_pos),     # 10, rad
   joint_vel * 0.05,                  # 10, rad/s
   last_action,                       # 10
 ]
 ```
 
-当前站立版本里 `command = [0, 0, 0]`。后续低速行走可以在同一个观测槽里采样小速度命令，不需要改部署接口。
+零速站立时 `command = [0, 0, 0]`。行走/转向时 sim2sim 或部署侧应输入 `[vx, 0, wz]`，左右旋转对应 `wz`。gait phase 可按策略控制周期积分并对 `gait_cycle_period=0.6s` 取模。
 
 YIS320 迁移对应关系：
 
@@ -185,22 +186,24 @@ source/oceanisaaclab/oceanisaaclab/tasks/direct/oceanisaaclab/__init__.py
 迁移到 `oceanbdx` 前必须逐项确认：
 
 1. Isaac Lab 解析出的 `robot.joint_names` 与 `oceanbdx.yaml` 的 `joint_names` 顺序一致。
-2. `policy.num_obs` 应为 39，或保持 `0` 自动推断为 `9 + 3 * num_joints`。
+2. 低速行走 v2 的 `policy.num_obs` 应为 41；旧站立 39 维策略不能和 v2 checkpoint 混用。
 3. `default_dof_pos` 为全 0。
 4. `action_scale = 0.25`。
 5. `clip_actions = 1.0`。
 6. `ang_vel_scale = 0.25`，`dof_pos_scale = 1.0`，`dof_vel_scale = 0.05`。
-7. `commands_scale = [2.0, 2.0, 0.25]`。
-8. IMU 四元数顺序和坐标系已对齐 base_link。
-9. 真机先吊起或支撑测试，确认 10 个关节目标方向正确后再落地。
+7. 低速行走 v2 的 `commands_scale = [2.0, 2.0, 1.0]`。
+8. 低速行走 v2 必须在 command 后拼接 `[sin(gait_phase), cos(gait_phase)]`。
+9. IMU 四元数顺序和坐标系已对齐 base_link。
+10. 真机先吊起或支撑测试，确认 10 个关节目标方向正确后再落地。
 
 ## 后续低速行走扩展
 
-当前代码已保留 `command = [vx, vy, wz]` 的观测槽。低速行走版本需要增加：
+当前低速行走 v2 已使用 `command = [vx, vy, wz]` 和 gait clock。训练配置：
 
 ```text
-command sampling: vx 0.0-0.3 m/s, vy 0, wz 小范围
-reward: linear velocity tracking, yaw tracking, foot slip penalty, action smoothness
+command sampling: vx 0.10-0.35 m/s (训练早期由命令课程压到 0.15-0.30), vy 0, wz -0.8-0.8 rad/s
+reward: linear velocity tracking (sigma=0.06), yaw tracking, phase support-contact + swing-contact penalty,
+        foot slip penalty, foot-sole clearance (脚底间隙, 减去 foot_origin_offset=0.067), action smoothness
 termination: base height, projected gravity, joint limits
 ```
 

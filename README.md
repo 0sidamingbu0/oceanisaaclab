@@ -12,6 +12,21 @@ It allows you to develop in an isolated environment, outside of the core Isaac L
 
 **Keywords:** extension, template, isaaclab
 
+## Python 运行约定（重要）
+
+本工程的所有 Python 脚本都必须用 Isaac Lab 自带的解释器运行，而**不是系统 `python`**：
+
+```bash
+./_isaaclab/isaaclab.sh -p <脚本> [参数]
+```
+
+系统 `python` 缺少 `tensorboard`、`torch`、`isaaclab` 等依赖，直接跑会 `ModuleNotFoundError`。
+例如离线解析训练曲线：
+
+```bash
+./_isaaclab/isaaclab.sh -p scripts/analyze_tb.py logs/rsl_rl/<task>/<run>
+```
+
 ## Changelog / 修改记录
 
 每天的修改记录统一放在 [`changelog/`](changelog/) 文件夹中，按日期命名（`YYYY-MM-DD.md`，如 [`changelog/2026-06-25.md`](changelog/2026-06-25.md)）。
