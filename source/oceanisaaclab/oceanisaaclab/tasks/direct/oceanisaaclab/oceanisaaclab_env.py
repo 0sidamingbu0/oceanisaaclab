@@ -400,6 +400,12 @@ class OceanisaaclabEnv(DirectRLEnv):
         non_standing[standing] = False
         turn_in_place = (torch.rand(len(env_ids), device=self.device) < self.cfg.turn_in_place_prob) & non_standing
         self._commands[env_ids[turn_in_place], 0] = 0.0
+        # Of the envs that actually translate, flip a fraction to a backward vx command so
+        # forward and backward walking are both inside the training distribution (before
+        # this, vx was always sampled positive → only one direction was ever trained).
+        moving = non_standing & ~turn_in_place
+        backward = (torch.rand(len(env_ids), device=self.device) < self.cfg.backward_prob) & moving
+        self._commands[env_ids[backward], 0] *= -1.0
         moving_or_turning = ~standing
         self._commands[env_ids[moving_or_turning], 2] = sample_uniform(
             self.cfg.command_wz_range[0],
@@ -437,16 +443,17 @@ class OceanisaaclabEnv(DirectRLEnv):
         default_root_pose = self.robot.data.default_root_pose.torch[env_ids].clone()
         default_root_vel = self.robot.data.default_root_vel.torch[env_ids].clone()
         default_root_pose[:, :3] += self.scene.env_origins[env_ids]
-        # Reference-state init: give ~half of the vx-commanded envs a starting forward
-        # velocity ≈ command (default yaw≈0 so world-x ≈ body-x). Bootstrapping the first
-        # step from a standstill is the hardest part of learning to walk; starting some
-        # envs already moving removes that barrier and weakens the standing attractor.
-        moving = non_standing & ~turn_in_place
+        # Reference-state init: give ~half of the vx-commanded envs a starting velocity
+        # matching their (signed, possibly backward) command (default yaw≈0 so world-x ≈
+        # body-x). Bootstrapping the first step from a standstill is the hardest part of
+        # learning to walk; starting some envs already moving removes that barrier and
+        # weakens the standing attractor.
         seeded = moving & (torch.rand(len(env_ids), device=self.device) < 0.5)
         vx_seed = self._commands[env_ids, 0] + sample_uniform(
             -0.05, 0.05, (len(env_ids),), self.device
         )
-        # head-forward = forward_vx_sign * body-x; at reset yaw≈0 so world-x ≈ body-x
+        # head-forward = forward_vx_sign * body-x; at reset yaw≈0 so world-x ≈ body-x.
+        # vx_seed carries the command sign, so backward commands seed a backward velocity.
         default_root_vel[seeded, 0] = self.cfg.forward_vx_sign * vx_seed[seeded]
 
         self.robot.write_root_pose_to_sim_index(root_pose=default_root_pose, env_ids=env_ids)
@@ -528,20 +535,27 @@ def compute_rewards(
     stepping_gate = torch.maximum(moving_command, instability)
     stable_stand_gate = stand_command * stability
 
-    # Forward-progress gate. For a forward (vx) command, gait-shaping rewards are scaled by
-    # how much of the commanded forward speed is actually realized: fwd_frac in [0,1] is 0 for
-    # a robot marching in place (vx≈0) and 1 at/above commanded speed. This kills the
-    # "march in place" local optimum — stepping only pays if it produces forward motion.
-    # Non-forward commands (turn-in-place / stance) keep gate=1 so their turning/gait rewards
-    # are unaffected; and instability lifts the gate so push-recovery stepping is never gated.
+    # Directional-progress gate. For a translating (vx) command of either sign, gait-shaping
+    # rewards are scaled by how much of the commanded speed is actually realized IN THE
+    # COMMANDED DIRECTION: fwd_frac in [0,1] is 0 for a robot marching in place (vx≈0) and 1
+    # at/above commanded speed. This kills the "march in place" local optimum — stepping only
+    # pays if it produces motion the right way. Non-translating commands (turn-in-place /
+    # stance) keep gate=1 so their turning/gait rewards are unaffected; and instability lifts
+    # the gate so push-recovery stepping is never gated.
     vx_cmd = commands[:, 0]
+    vx_cmd_sign = torch.sign(vx_cmd)
+    vx_cmd_abs = torch.abs(vx_cmd)
     # Head-forward speed. URDF base_link +x points to the robot's tail (head faces -x),
     # so measured body-x velocity must be sign-corrected before comparing against the
     # forward command. Without this the policy learns to walk backwards relative to the
     # head (the 07-01 "W walks backwards / S falls forward" bug).
     vx_act = forward_vx_sign * root_lin_vel_b[:, 0]
-    forward_command = (vx_cmd > move_command_threshold).float()
-    fwd_frac = torch.clamp(vx_act / torch.clamp(vx_cmd, min=1e-3), 0.0, 1.0)
+    forward_command = (vx_cmd_abs > move_command_threshold).float()
+    # vx_act * vx_cmd_sign projects realized speed onto the commanded direction: positive when
+    # moving the commanded way (forward OR backward), negative when moving opposite → clamped
+    # to 0. Divide by the command magnitude, not the signed command, so the epsilon guard works
+    # for negative commands too.
+    fwd_frac = torch.clamp((vx_act * vx_cmd_sign) / torch.clamp(vx_cmd_abs, min=1e-3), 0.0, 1.0)
     fwd_gate = torch.where(forward_command > 0.5, fwd_frac, torch.ones_like(fwd_frac))
     progress_pay = torch.maximum(fwd_gate, instability)
 
@@ -557,10 +571,11 @@ def compute_rewards(
     rew_track_lin_vel = rew_scale_track_lin_vel * torch.exp(-lin_vel_error / lin_vel_track_sigma)
     ang_vel_error = torch.square(commands[:, 2] - root_ang_vel_b[:, 2])
     rew_track_ang_vel = rew_scale_track_ang_vel * torch.exp(-ang_vel_error / ang_vel_track_sigma)
-    # Linear forward-progress reward. The exp tracking term is nearly flat near vx=0, giving a
-    # weak gradient to *start* translating; this linear term pays proportionally to realized
-    # forward speed (capped at the command) so there is a constant push to move forward. Zero
-    # for stance and turn-in-place, so it cannot be farmed by marching in place.
+    # Linear directional-progress reward. The exp tracking term is nearly flat near vx=0,
+    # giving a weak gradient to *start* translating; this linear term pays proportionally to
+    # realized speed in the commanded direction (fwd_frac, capped at the command magnitude) so
+    # there is a constant push to move either forward or backward as commanded. Zero for stance
+    # and turn-in-place, so it cannot be farmed by marching in place.
     rew_progress = rew_scale_progress * fwd_frac * forward_command
     # suppress non-commanded lateral motion (vy). Yaw is handled by tracking.
     rew_lateral = rew_scale_lateral * torch.square(root_lin_vel_b[:, 1])

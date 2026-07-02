@@ -130,6 +130,7 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     # - velocity command sampling (walking task)
     command_vx_range = (0.10, 0.25)  # [m/s]  低速前进范围（课程终点）；上限压到 0.25，先把能走稳的速度练扎实（实测 0.3 会后仰摔），以后再抬
     command_wz_range = (-0.8, 0.8)  # [rad/s]  yaw 命令范围；sim2sim 左右旋转必须在训练分布内
+    backward_prob = 0.5  # 实际平移(非站立/非原地转向)样本中，vx 命令翻转为后退的比例；前后对称训练，让 W/S 双向都在分布内
     stand_still_prob = 0.15  # 保留少量零速站立样本，削弱站立吸引子占比，逼大多数 env 学行走/转向
     turn_in_place_prob = 0.25  # 非站立样本中一部分设 vx=0，只训练原地转向迈步
     move_command_threshold = 0.08  # [m/s or rad/s]  低于该阈值按站立命令处理
@@ -190,7 +191,9 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     min_base_height = 0.25  # [m]
     min_upright_projection = 0.65
     # - random lateral push disturbance
-    enable_random_push = True
+    # 【诊断性关闭 2026-07-02】走路总晃悠，怀疑随机推力训练让策略学成"随时准备迈步"的不稳姿态。
+    #   先关掉全部随机推力训一版，隔离验证无干扰下能否稳定站立/走动。恢复抗推：改回 True 即可。
+    enable_random_push = False
     push_force_range = (8.0, 20.0)  # [N]  从头学步态先轻推，避免初期只学摔倒/硬撑
     push_duration_s = 0.18
     push_interval_s = (1.0, 2.0)
