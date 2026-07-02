@@ -72,7 +72,7 @@ for t in range(args.steps):
         obs = env._get_observations()["policy"]
     if t < warmup:
         continue
-    fwd.append(env.robot.data.root_lin_vel_b.torch[:, 0])
+    fwd.append(cfg.forward_vx_sign * env.robot.data.root_lin_vel_b.torch[:, 0])
     yaw.append(env.robot.data.root_ang_vel_b.torch[:, 2])
     base_h.append(env.robot.data.root_pos_w.torch[:, 2])
     ang_xy.append(torch.norm(env.robot.data.root_ang_vel_b.torch[:, :2], dim=1))
@@ -98,7 +98,7 @@ BC = torch.stack(both_c)
 print("\n================ WALK POLICY DIAGNOSTICS (push OFF) ================")
 print(f"checkpoint: {args.checkpoint}")
 print(f"commanded vx={args.vx}  wz={args.wz}   envs={args.num_envs}  measured_steps={args.steps-warmup}")
-print(f"\n[跟踪] 实际前进 vx [m/s] mean={FWD.mean():.3f} std={FWD.std():.3f}  (命令 {args.vx}) -> 跟踪比 {FWD.mean()/max(args.vx,1e-6):.2f}")
+print(f"\n[跟踪] 实际前进(头部朝向) vx [m/s] mean={FWD.mean():.3f} std={FWD.std():.3f}  (命令 {args.vx}) -> 跟踪比 {FWD.mean()/max(args.vx,1e-6):.2f}")
 print(f"[跟踪] 实际 yaw rate [rad/s] mean={YAW.mean():.3f} std={YAW.std():.3f}  (命令 {args.wz})")
 print(f"\n[机身] base height [m] mean={BH.mean():.3f} std={BH.std():.3f}  (目标 0.42)")
 print(f"[机身] roll/pitch 角速度模 [rad/s] mean={AXY.mean():.3f} p95={torch.quantile(AXY.flatten(),0.95):.2f} max={AXY.max():.2f}  (抖动指标)")
