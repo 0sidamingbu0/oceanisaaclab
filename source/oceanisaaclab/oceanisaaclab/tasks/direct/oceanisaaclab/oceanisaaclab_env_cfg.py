@@ -119,6 +119,14 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     dof_pos_scale = 1.0
     dof_vel_scale = 0.05
     command_scale = (2.0, 2.0, 1.0)
+    # - forward direction sign (URDF base_link +x points to the robot's TAIL, head faces -x):
+    #   evidence: neck_n1_joint attaches at x=-0.074 (head side), legs at x=+0.021,
+    #   leg_r1 at y=+0.045 / leg_l1 at y=-0.047 (right=+y, consistent with facing -x);
+    #   sim2sim 实测 07-01 checkpoint「+vx 命令朝物理后方走得好」也与此自洽。
+    #   forward_vx_sign 把「前进 vx 命令」重新定义为头部朝向：head-forward speed =
+    #   forward_vx_sign * root_lin_vel_b[:, 0]。只改奖励/reset 注入的前向定义，
+    #   不改观测坐标系（观测保持 base 系，sim/real IMU 一致）。改后需从头重训。
+    forward_vx_sign = -1.0
     # - velocity command sampling (walking task)
     command_vx_range = (0.10, 0.25)  # [m/s]  低速前进范围（课程终点）；上限压到 0.25，先把能走稳的速度练扎实（实测 0.3 会后仰摔），以后再抬
     command_wz_range = (-0.8, 0.8)  # [rad/s]  yaw 命令范围；sim2sim 左右旋转必须在训练分布内

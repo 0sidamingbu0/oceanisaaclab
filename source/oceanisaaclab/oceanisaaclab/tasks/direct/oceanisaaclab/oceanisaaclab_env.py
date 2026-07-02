@@ -332,6 +332,7 @@ class OceanisaaclabEnv(DirectRLEnv):
             self.cfg.lin_vel_track_sigma,
             self.cfg.ang_vel_track_sigma,
             self.cfg.gait_duty_factor,
+            self.cfg.forward_vx_sign,
             self.robot.data.root_pos_w.torch[:, 2],
             self._commands,
             self._gait_phase(),
@@ -445,7 +446,8 @@ class OceanisaaclabEnv(DirectRLEnv):
         vx_seed = self._commands[env_ids, 0] + sample_uniform(
             -0.05, 0.05, (len(env_ids),), self.device
         )
-        default_root_vel[seeded, 0] = vx_seed[seeded]
+        # head-forward = forward_vx_sign * body-x; at reset yaw≈0 so world-x ≈ body-x
+        default_root_vel[seeded, 0] = self.cfg.forward_vx_sign * vx_seed[seeded]
 
         self.robot.write_root_pose_to_sim_index(root_pose=default_root_pose, env_ids=env_ids)
         self.robot.write_root_velocity_to_sim_index(root_velocity=default_root_vel, env_ids=env_ids)
@@ -495,6 +497,7 @@ def compute_rewards(
     lin_vel_track_sigma: float,
     ang_vel_track_sigma: float,
     gait_duty_factor: float,
+    forward_vx_sign: float,
     base_height: torch.Tensor,
     commands: torch.Tensor,
     gait_phase: torch.Tensor,
@@ -532,7 +535,11 @@ def compute_rewards(
     # Non-forward commands (turn-in-place / stance) keep gate=1 so their turning/gait rewards
     # are unaffected; and instability lifts the gate so push-recovery stepping is never gated.
     vx_cmd = commands[:, 0]
-    vx_act = root_lin_vel_b[:, 0]
+    # Head-forward speed. URDF base_link +x points to the robot's tail (head faces -x),
+    # so measured body-x velocity must be sign-corrected before comparing against the
+    # forward command. Without this the policy learns to walk backwards relative to the
+    # head (the 07-01 "W walks backwards / S falls forward" bug).
+    vx_act = forward_vx_sign * root_lin_vel_b[:, 0]
     forward_command = (vx_cmd > move_command_threshold).float()
     fwd_frac = torch.clamp(vx_act / torch.clamp(vx_cmd, min=1e-3), 0.0, 1.0)
     fwd_gate = torch.where(forward_command > 0.5, fwd_frac, torch.ones_like(fwd_frac))
@@ -546,7 +553,7 @@ def compute_rewards(
     rew_ang_vel = rew_scale_ang_vel * torch.sum(torch.square(root_ang_vel_b[:, :2]), dim=1)
     # Track vx/yaw commands. The sim2sim arrow keys map naturally to these
     # command slots, so both must be trained and rewarded.
-    lin_vel_error = torch.square(commands[:, 0] - root_lin_vel_b[:, 0])
+    lin_vel_error = torch.square(commands[:, 0] - vx_act)
     rew_track_lin_vel = rew_scale_track_lin_vel * torch.exp(-lin_vel_error / lin_vel_track_sigma)
     ang_vel_error = torch.square(commands[:, 2] - root_ang_vel_b[:, 2])
     rew_track_ang_vel = rew_scale_track_ang_vel * torch.exp(-ang_vel_error / ang_vel_track_sigma)
