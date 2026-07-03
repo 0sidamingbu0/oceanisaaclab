@@ -327,11 +327,15 @@ class OceanisaaclabEnv(DirectRLEnv):
             torch.max(torch.abs(self._commands[:, :2]), dim=1).values > self.cfg.move_command_threshold
         ) | (torch.abs(self._commands[:, 2]) > self.cfg.move_command_threshold)
         gait_clock = gait_clock * moving_mask.float().unsqueeze(1)
-        # both-feet contact booleans: available on the real robot via foot switches and
-        # a big help for gait-phase alignment (matches the BDX observation set).
-        feet_contact = (
-            self.contact_sensor.data.current_contact_time.torch[:, self._feet_contact_ids] > 0.0
-        ).float()
+        # NOTE: both-feet contact booleans were dropped from the observation on purpose.
+        # The real BDX uses per-foot switches (Open Duck Mini even multi-point ones for
+        # uneven ground), but this project deliberately ships without foot-contact hardware
+        # to keep the sole simple. The gait clock already carries the phase; measured
+        # contact only added an actual-vs-commanded feedback channel, and feeding a clean
+        # sim contact while the real robot has none (or a flaky switch) is a sim2real trap.
+        # obs is therefore 41-dim (no feet_contact). Contact still drives the imitation
+        # reward (route B) and gait-phase rewards (route A) — those are training signals,
+        # not policy inputs, so the real robot needs no foot sensing.
 
         if self.cfg.enable_obs_noise:
             ang_vel = ang_vel + torch.randn_like(ang_vel) * self.cfg.noise_ang_vel
@@ -345,7 +349,6 @@ class OceanisaaclabEnv(DirectRLEnv):
                 proj_g,
                 self._commands * self._command_scale,
                 gait_clock,
-                feet_contact,
                 joint_pos * self.cfg.dof_pos_scale,
                 joint_vel * self.cfg.dof_vel_scale,
                 self._actions,

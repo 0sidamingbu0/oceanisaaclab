@@ -9,7 +9,7 @@
 主导（关节角 L2 匹配 + 接触时序匹配 + 基座姿态/高度/速度匹配），彻底删除路线 A 的
 fwd_gate / instability gate / phase_contact / swing_contact / single_support /
 feet_clearance / feet_air_time / stand_still 手工塑形联动栈——这些打地鼠问题由参考
-轨迹一次性根治。观测布局与路线 A 完全一致（43 维），sim2sim 部署链路不变。
+轨迹一次性根治。观测布局与路线 A 完全一致（41 维，无足底接触量），sim2sim 部署链路不变。
 """
 
 from isaaclab.utils.configclass import configclass
@@ -60,3 +60,13 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     #   基座姿态/速度出发，episode 从步态中段开始，绕过「从静止起步」这一最难阶段
     rsi_prob = 0.9
     rsi_joint_pos_noise = 0.03  # [rad] RSI 关节角附加噪声
+
+    # - 课程 override（仅路线 B）
+    # 命令幅度课程关掉：模仿范式不需要「由慢到快」的爬坡。RSI（90% env 从随机相位参考帧
+    # 出发）已绕过「从静止起步」这一最难阶段；参考库对全命令网格 vx∈{-0.25..0.25} 都有
+    # 逐帧参考、零命令点即站立帧、插值天然给出「命令→0 步幅→0」，任何速度下学习信号都
+    # 密集且良定义。开着反而前期把 vx 压在起点、高速参考帧长期见不到，拖慢高速段收敛。
+    enable_command_curriculum = False
+    # 推力课程保留（抗扰鲁棒性模仿一样需要）：但不再有命令课程走满作为锚点，且 RSI 收敛快，
+    # 把起爬点从 120_000 提前到 60_000（≈2500 iter），让抗推早点介入。
+    push_curriculum_start_step = 60_000

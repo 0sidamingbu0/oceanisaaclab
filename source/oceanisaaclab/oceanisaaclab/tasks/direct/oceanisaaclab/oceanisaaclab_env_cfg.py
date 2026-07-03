@@ -27,8 +27,13 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     episode_length_s = 8.0
     # - spaces definition
     action_space = 10
-    # 41 原始维 + 2 双脚接触布尔量（真机脚底开关可得；对步态相位对齐帮助大，对照 BDX 复刻观测）
-    observation_space = 43
+    # 41 维：ang_vel3 + proj_g3 + cmd3 + gait_clock2 + Δjoint10 + jvel10 + last_action10
+    # 双脚接触布尔量已从观测移除：本项目直接不装足底接触开关（BDX/Open Duck 真机才有，
+    # 全尺寸 BDX 甚至多点位以应对不平地面，硬件太复杂）。相位信息已由 gait_clock 承载，
+    # 实测接触仅提供“指令 vs 实际接触”反馈；且干净 sim 接触喂给无/不可靠开关的真机是
+    # sim2real 陷阱。接触仍用于奖励（路线 A 步态相位 / 路线 B imit_contact），那是训练
+    # 信号而非策略输入，真机无需任何足底检测。
+    observation_space = 41
     state_space = 0
 
     # simulation

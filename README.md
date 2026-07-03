@@ -29,7 +29,7 @@
 | `Ocean-BDX-Stand-Direct-v0` | 路线 A | 手工塑形奖励（速度跟踪 + 步态相位 + 稳定性等 20+ 项） | `logs/rsl_rl/bdx_walk_phase/` |
 | `Ocean-BDX-Walk-Direct-v0` | 路线 B | BDX 式参考步态模仿（关节角/接触/姿态匹配为主） | `logs/rsl_rl/bdx_walk_imitation/` |
 
-观测 43 维（两条路线一致，sim2sim 链路通用）。
+观测 41 维（两条路线一致，sim2sim 链路通用）。本项目不装足底接触开关，观测里不含双足接触量。
 
 ### 路线 B：参考步态模仿 `Ocean-BDX-Walk-Direct-v0`
 
