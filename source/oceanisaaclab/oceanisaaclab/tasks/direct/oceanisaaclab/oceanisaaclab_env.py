@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import torch
+import warp as wp
 from collections.abc import Sequence
 
 import isaaclab.sim as sim_utils
@@ -138,10 +139,19 @@ class OceanisaaclabEnv(DirectRLEnv):
         physx_view = getattr(self.robot, "root_physx_view", None)
         if physx_view is not None:
             lo, hi = self.cfg.dr_friction_scale_range
-            materials = physx_view.get_material_properties()
+            # get_material_properties() returns a warp array (host/CPU buffer, shape
+            # (num_envs, num_shapes, 3): static friction, dynamic friction, restitution).
+            # Wrap with wp.to_torch to edit as a torch tensor, scale the two friction
+            # columns per-env, then hand back warp arrays (CPU int32 env ids) as the
+            # PhysX tensor API requires.
+            materials = wp.to_torch(physx_view.get_material_properties())
             friction_scale = sample_uniform(lo, hi, (materials.shape[0], 1, 1), materials.device)
             materials[..., :2] = materials[..., :2] * friction_scale
-            physx_view.set_material_properties(materials, torch.arange(self.num_envs))
+            env_ids_cpu = torch.arange(self.num_envs, dtype=torch.int32)
+            physx_view.set_material_properties(
+                wp.from_torch(materials.contiguous(), dtype=wp.float32),
+                wp.from_torch(env_ids_cpu, dtype=wp.int32),
+            )
         else:
             import omni.log
 
