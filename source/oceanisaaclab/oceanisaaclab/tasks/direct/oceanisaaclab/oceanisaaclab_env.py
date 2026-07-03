@@ -99,10 +99,11 @@ class OceanisaaclabEnv(DirectRLEnv):
         from isaaclab.actuators import ImplicitActuator
 
         all_env_ids = torch.arange(self.num_envs, dtype=torch.int32, device=self.device)
-        # 1) body masses: scale every link mass by a single per-env factor.
+        # 1) body masses: scale every link mass by a single per-env factor
+        #    ((num_envs, 1) scale broadcasts over all bodies of that env).
         lo, hi = self.cfg.dr_mass_scale_range
-        mass_data = self.robot.data.body_mass if hasattr(self.robot.data, "body_mass") else self.robot.data.default_mass
-        default_mass = mass_data.torch.clone()
+        mass_attr = "body_mass" if hasattr(self.robot.data, "body_mass") else "default_mass"
+        default_mass = getattr(self.robot.data, mass_attr).torch.clone()
         mass_scale = sample_uniform(lo, hi, (self.num_envs, 1), self.device)
         body_ids = torch.arange(self.robot.num_bodies, dtype=torch.int32, device=self.device)
         self.robot.set_masses_index(
@@ -115,7 +116,7 @@ class OceanisaaclabEnv(DirectRLEnv):
         for actuator in self.robot.actuators.values():
             joint_indices = actuator.joint_indices
             if isinstance(joint_indices, slice):
-                joint_indices = torch.arange(self.robot.num_joints, device=self.device)
+                joint_indices = torch.arange(self.robot.num_joints, device=self.device)[joint_indices]
             stiffness = actuator.stiffness * sample_uniform(lo, hi, actuator.stiffness.shape, self.device)
             damping = actuator.damping * sample_uniform(lo, hi, actuator.damping.shape, self.device)
             actuator.stiffness[:] = stiffness
@@ -142,7 +143,9 @@ class OceanisaaclabEnv(DirectRLEnv):
             materials[..., :2] = materials[..., :2] * friction_scale
             physx_view.set_material_properties(materials, torch.arange(self.num_envs))
         else:
-            print("[WARN] domain rand: robot has no root_physx_view; skipping friction randomization.")
+            import omni.log
+
+            omni.log.warn("domain rand: robot has no root_physx_view; skipping friction randomization.")
 
     def _find_joint_ids(self, joint_names: Sequence[str]) -> list[int]:
         joint_ids = []
@@ -658,8 +661,9 @@ def compute_rewards(
     # project realized planar velocity onto the commanded direction: positive when moving
     # the commanded way, negative when moving opposite → clamped to 0. Divide by the
     # command magnitude so fwd_frac hits 1 at/above the commanded speed.
-    along_cmd = torch.sum(act_planar * cmd_planar, dim=1) / torch.clamp(cmd_planar_norm, min=1e-3)
-    fwd_frac = torch.clamp(along_cmd / torch.clamp(cmd_planar_norm, min=1e-3), 0.0, 1.0)
+    along_cmd = torch.sum(act_planar * cmd_planar, dim=1)
+    cmd_norm_safe = torch.clamp(cmd_planar_norm, min=1e-3)
+    fwd_frac = torch.clamp(along_cmd / (cmd_norm_safe * cmd_norm_safe), 0.0, 1.0)
     fwd_gate = torch.where(forward_command > 0.5, fwd_frac, torch.ones_like(fwd_frac))
     progress_pay = torch.maximum(fwd_gate, instability)
 
