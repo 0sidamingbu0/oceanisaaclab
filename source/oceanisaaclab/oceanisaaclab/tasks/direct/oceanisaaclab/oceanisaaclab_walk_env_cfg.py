@@ -21,11 +21,13 @@ from .oceanisaaclab_env_cfg import OCEAN_ASSET_DIR, OceanisaaclabEnvCfg
 class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     """参考模仿行走任务配置（Ocean-BDX-Walk-Direct-v0）。"""
 
-    # 参考步态库（scripts/gen_reference_gait.py 生成；改库参数需同步重新生成）
+    # 参考步态库（scripts/gen_reference_gait.py 生成，placo IK + meshcat 可视化；
+    # 改库参数需同步重新生成，并可用 scripts/play_reference_gait.py 播放确认）
     gait_library_path = str(OCEAN_ASSET_DIR / "gaits" / "reference_gait.npz")
 
-    # 参考步态基座高度为微蹲 0.36m（留 IK 上下工作空间），非路线 A 的 0.42 伸直站高
-    target_base_height = 0.36
+    # 参考步态基座高度 = URDF 全零姿态（BDX 标准屈膝站立，腿部有伸直角度预留）的
+    # FK 站立高度 ≈0.385m。不额外下蹲——伸直余量留给摆动/迈步。
+    target_base_height = 0.385
 
     # - 模仿奖励（正奖励为主，DeepMimic/AWD 风格 exp 核）
     rew_scale_imit_joint_pos = 3.0  # 关节角匹配：主导项
