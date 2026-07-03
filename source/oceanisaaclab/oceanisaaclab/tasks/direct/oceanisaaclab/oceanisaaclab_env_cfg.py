@@ -27,7 +27,8 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     episode_length_s = 8.0
     # - spaces definition
     action_space = 10
-    observation_space = 41
+    # 41 原始维 + 2 双脚接触布尔量（真机脚底开关可得；对步态相位对齐帮助大，对照 BDX 复刻观测）
+    observation_space = 43
     state_space = 0
 
     # simulation
@@ -128,7 +129,13 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     #   不改观测坐标系（观测保持 base 系，sim/real IMU 一致）。改后需从头重训。
     forward_vx_sign = -1.0
     # - velocity command sampling (walking task)
-    command_vx_range = (0.10, 0.25)  # [m/s]  低速前进范围（课程终点）；上限压到 0.25，先把能走稳的速度练扎实（实测 0.3 会后仰摔），以后再抬
+    # 【2026-07-03 对照 BDX 修正】vx 下限补 0~0.10 低速段（低速微调命令曾是分布外）；
+    #   采样后 |vx|<move_command_threshold 会被钳到 0，语义保持清晰。
+    command_vx_range = (0.0, 0.25)  # [m/s]  低速前进范围（课程终点）；上限压到 0.25，先把能走稳的速度练扎实（实测 0.3 会后仰摔），以后再抬
+    # 【2026-07-03 新增】侧向 vy 命令训练。此前 vy 恒 0 且被无条件惩罚，sim2sim 左右平移
+    #   是完全分布外输入（"左会摔"的直接原因）。本机无踝滚转关节，侧向稳定只能靠髋 roll+迈步，
+    #   必须显式训练。范围对照 Open Duck mini ±0.2 / go_bdx ±0.3，取保守 ±0.15 起步。
+    command_vy_range = (-0.15, 0.15)  # [m/s]  头部左向为正（与 forward_vx_sign 同一约定）
     command_wz_range = (-0.8, 0.8)  # [rad/s]  yaw 命令范围；sim2sim 左右旋转必须在训练分布内
     backward_prob = 0.5  # 实际平移(非站立/非原地转向)样本中，vx 命令翻转为后退的比例；前后对称训练，让 W/S 双向都在分布内
     stand_still_prob = 0.15  # 保留少量零速站立样本，削弱站立吸引子占比，逼大多数 env 学行走/转向
@@ -146,7 +153,7 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     foot_origin_offset = 0.067  # [m]
     # - 命令幅度课程：训练早期把 vx 命令上限压窄（先让步态成形），按 common_step 线性放开到 command_vx_range。
     enable_command_curriculum = True
-    command_vx_range_start = (0.10, 0.18)  # [m/s]  课程起点：一开始只学慢速走稳，别一上来就要求 0.3
+    command_vx_range_start = (0.0, 0.18)  # [m/s]  课程起点：一开始只学慢速走稳，别一上来就要求 0.3
     command_curriculum_steps = 120_000  # common_step 数（≈5000 iter×24）内从起点线性放开到终点；放慢，每个速度档有时间巩固
     # - push-recovery via stepping (instability-gated, IMU-observable signals only)
     #   失衡度 = sigmoid 组合躯干倾斜 |proj_g_xy| 与倾倒角速度 |ang_vel_xy|（真机 IMU 均可得）；
@@ -165,12 +172,18 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     rew_scale_alive = 0.5  # 降低站立类正奖励占比，避免站着不动主导 return
     rew_scale_terminated = -5.0
     rew_scale_upright = 1.0  # 降低站立类正奖励占比
+    # 【2026-07-03 对照 BDX 修正】行走标称前倾角：BDX 的躯干前倾是参考步态硬约束
+    #   （go_bdx 全尺寸约 8°、Open Duck mini 约 3°），本机同样无踝滚转、踝只有 pitch，
+    #   行走时必须把重心压到支撑面前部。旧 upright 项无条件奖励绝对竖直，主动对抗
+    #   行走所需的自然前倾——"行走时身体姿态差"的最直接配置错误。改法：upright 项
+    #   在移动命令下以该前倾角为目标姿态（站立命令仍竖直），从 3°~8° 中值 5° 试起。
+    walk_lean_angle = 0.087  # [rad] ≈5°  移动命令下躯干头部朝向的目标前倾角
     rew_scale_height = 0.5  # 降低站立类正奖励占比
     rew_scale_ang_vel = -0.06  # 惩罚 roll/pitch 角速度（机身平稳）；行走时调弱，避免压制自然躯干摆动
-    rew_scale_track_lin_vel = 3.0  # vx 指令跟踪（行走主驱动），提权
+    rew_scale_track_lin_vel = 3.0  # vx/vy 平面速度指令跟踪（行走主驱动），提权；2026-07-03 起含侧向 vy
     rew_scale_track_ang_vel = 1.2  # yaw 命令跟踪（原地转向/左右旋转主驱动）
-    rew_scale_progress = 1.5  # 线性前进奖励 min(vx,cmd)/cmd：给 vx≈0 附近持续的"往前走"梯度（exp 项此处太平），只对前进命令生效
-    rew_scale_lateral = -0.8  # 惩罚非指令的侧移 vy，保留一定恢复余量
+    rew_scale_progress = 1.5  # 线性前进奖励 min(v∥,cmd)/cmd：给平面速度≈0 附近持续的"往命令方向走"梯度（exp 项此处太平），只对平移命令生效
+    rew_scale_lateral = -0.8  # 惩罚 vy 与命令的偏差（2026-07-03 前是无条件惩罚一切 vy²，与 vy 训练冲突）
     rew_scale_joint_pos = -0.08
     rew_scale_joint_vel = -0.01  # 行走阶段放松关节速度，避免把迈步压成小幅抖动
     rew_scale_action_rate = -0.05  # 行走阶段放松动作变化率；抗抖主要交给零速/接触项
@@ -198,12 +211,15 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     min_base_height = 0.25  # [m]
     min_upright_projection = 0.65
     # - random lateral push disturbance
-    # 【诊断性关闭 2026-07-02】走路总晃悠，怀疑随机推力训练让策略学成"随时准备迈步"的不稳姿态。
-    #   先关掉全部随机推力训一版，隔离验证无干扰下能否稳定站立/走动。恢复抗推：改回 True 即可。
-    enable_random_push = False
+    # 【2026-07-03 对照 BDX 重开】07-02 曾全关验证"晃悠姿态"假设。对照结论：问题不在
+    #   推力本身而在密度——旧间隔 1~2s，8s episode 里机器人永远处于"刚被推/即将被推"状态，
+    #   学出"常态微失衡、随时准备迈步"的晃悠姿态是必然。Open Duck 推扰是每 5~10s 一次。
+    #   改法：重开推扰，间隔拉到 5~10s、幅度中等，让"无扰稳定站走"成为占绝对主导的
+    #   训练状态、推扰只是偶发事件。
+    enable_random_push = True
     push_force_range = (8.0, 20.0)  # [N]  从头学步态先轻推，避免初期只学摔倒/硬撑
     push_duration_s = 0.18
-    push_interval_s = (1.0, 2.0)
+    push_interval_s = (5.0, 10.0)  # [s]  对照 Open Duck 5~10s；原 1~2s 太密是晃悠姿态诱因
     # - push curriculum: ramp push magnitude up over training to force stepping recovery
     enable_push_curriculum = True
     push_force_range_max = (20.0, 40.0)  # [N]  课程终点：对 10kg 机身，0.18s 下 Δv≈0.36~0.72m/s，仍有挑战但可迈步恢复（70N=Δv1.26 太大直接踹飞）
@@ -214,3 +230,12 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     # 让策略先专心学走稳（命令课程 iter~5000 走满），走稳后再叠加抗推，避免"还没会走就被大推力砸"。
     push_curriculum_start_step = 120_000  # common_step（≈5000 iter×24）：命令课程走满后推力才开始往上爬
     push_curriculum_steps = 120_000  # 在多少 common_step 内从起点线性升到终点（≈5000 iter）；从 start_step 起算
+    # - domain randomization (per-env, sampled once at startup)
+    # 【2026-07-03 对照 BDX 新增】"训练 fall=0.23 但 sim2sim 一踏步就摔"是 DR 不足的典型症状：
+    #   此前只有观测噪声 + 动作延迟。BDX 复刻还随机化质量/摩擦/PD 增益等。每个 env 启动时
+    #   采样一组固定物理参数，2048+ envs 覆盖整个分布。幅度先取保守值，验证后再向
+    #   BDX 的 ×[0.5,1.5] 靠拢。
+    enable_domain_rand = True
+    dr_mass_scale_range = (0.8, 1.2)  # 全身各 link 质量缩放（BDX 复刻 ×[0.5,1.5]，先保守）
+    dr_friction_scale_range = (0.7, 1.3)  # 脚底/link 摩擦系数缩放（对照 BDX ×[0.7,1.3]）
+    dr_pd_gain_scale_range = (0.8, 1.2)  # 执行器 stiffness/damping 独立缩放（BDX ×[0.5,1.5]，先保守）

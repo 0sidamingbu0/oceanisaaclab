@@ -11,6 +11,7 @@ parser.add_argument("--checkpoint", type=str, required=True)
 parser.add_argument("--num_envs", type=int, default=64)
 parser.add_argument("--steps", type=int, default=400)
 parser.add_argument("--vx", type=float, default=0.3)
+parser.add_argument("--vy", type=float, default=0.0)
 parser.add_argument("--wz", type=float, default=0.0)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -52,7 +53,7 @@ def policy(o):
     return torch.nn.functional.linear(x, W6, b6)
 
 
-cmd = torch.tensor([args.vx, 0.0, args.wz], device=dev)
+cmd = torch.tensor([args.vx, args.vy, args.wz], device=dev)
 env.reset()
 env._commands[:] = cmd
 obs = env._get_observations()["policy"]
@@ -60,6 +61,7 @@ feet = env._feet_body_ids
 feet_c = env._feet_contact_ids
 
 fwd, yaw, base_h = [], [], []
+lat = []
 foot_h_all, foot_h_swing, in_contact_frac, both_c = [], [], [], []
 ang_xy = []
 warmup = 60
@@ -73,6 +75,7 @@ for t in range(args.steps):
     if t < warmup:
         continue
     fwd.append(cfg.forward_vx_sign * env.robot.data.root_lin_vel_b.torch[:, 0])
+    lat.append(cfg.forward_vx_sign * env.robot.data.root_lin_vel_b.torch[:, 1])
     yaw.append(env.robot.data.root_ang_vel_b.torch[:, 2])
     base_h.append(env.robot.data.root_pos_w.torch[:, 2])
     ang_xy.append(torch.norm(env.robot.data.root_ang_vel_b.torch[:, :2], dim=1))
@@ -87,6 +90,7 @@ for t in range(args.steps):
     both_c.append((in_c.sum(dim=1) == 2).float())
 
 FWD = torch.stack(fwd)
+LAT = torch.stack(lat)
 YAW = torch.stack(yaw)
 BH = torch.stack(base_h)
 AXY = torch.stack(ang_xy)
@@ -97,8 +101,10 @@ BC = torch.stack(both_c)
 
 print("\n================ WALK POLICY DIAGNOSTICS (push OFF) ================")
 print(f"checkpoint: {args.checkpoint}")
-print(f"commanded vx={args.vx}  wz={args.wz}   envs={args.num_envs}  measured_steps={args.steps-warmup}")
+print(f"commanded vx={args.vx}  vy={args.vy}  wz={args.wz}   envs={args.num_envs}  measured_steps={args.steps-warmup}")
 print(f"\n[跟踪] 实际前进(头部朝向) vx [m/s] mean={FWD.mean():.3f} std={FWD.std():.3f}  (命令 {args.vx}) -> 跟踪比 {FWD.mean()/max(args.vx,1e-6):.2f}")
+lat_track = f"{LAT.mean()/args.vy:.2f}" if abs(args.vy) > 1e-6 else "N/A"
+print(f"[跟踪] 实际侧向(头部左向) vy [m/s] mean={LAT.mean():.3f} std={LAT.std():.3f}  (命令 {args.vy}) -> 跟踪比 {lat_track}")
 print(f"[跟踪] 实际 yaw rate [rad/s] mean={YAW.mean():.3f} std={YAW.std():.3f}  (命令 {args.wz})")
 print(f"\n[机身] base height [m] mean={BH.mean():.3f} std={BH.std():.3f}  (目标 0.42)")
 print(f"[机身] roll/pitch 角速度模 [rad/s] mean={AXY.mean():.3f} p95={torch.quantile(AXY.flatten(),0.95):.2f} max={AXY.max():.2f}  (抖动指标)")
