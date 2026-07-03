@@ -39,3 +39,10 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class WalkPPORunnerCfg(PPORunnerCfg):
+    """路线 B（参考步态模仿）runner：网络/算法沿用路线 A，仅区分实验名。"""
+
+    experiment_name = "bdx_walk_imitation"
