@@ -29,6 +29,14 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     # FK 站立高度 ≈0.385m。不额外下蹲——伸直余量留给摆动/迈步。
     target_base_height = 0.385
 
+    # 动作幅度：target = default_leg(0) + action_scale * action，action 天然 ~[-1,1]。
+    # 参考步态摆动关节角峰值：膝 leg_[lr]4≈0.41rad、踝 leg_[lr]5≈0.31rad、全库 abs max≈0.5rad。
+    # 基类的 0.25 只能达 ±0.25rad → 膝/踝够不到参考摆动 → 策略只能匹配小幅髋摆(身体扭)、
+    # 抬脚饱和抬不起来（实测「完全不抬脚」的根因）。放大到 0.5 让参考幅度落在 action∈[-1,1] 内
+    # （膝峰值 0.41→action 0.82，留余量给平衡修正）。仅路线 B override，不动路线 A(浅步态 0.25 够用)。
+    # ⚠ 改动作语义，须从头重训；sim2sim/onnx 部署侧 action_scale 也要同步为 0.5。
+    action_scale = 0.5
+
     # - 模仿奖励（正奖励为主，DeepMimic/AWD 风格 exp 核）
     rew_scale_imit_joint_pos = 3.0  # 关节角匹配：主导项
     imit_joint_pos_sigma = 0.4  # exp(-Σ误差²/σ)；10 关节合计均方差 ~0.04 rad² 时 ≈0.9

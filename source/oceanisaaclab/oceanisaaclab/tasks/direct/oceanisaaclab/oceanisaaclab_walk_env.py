@@ -162,15 +162,16 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         joint_vel = self.robot.data.default_joint_vel.torch[rsi_ids].clone()
         joint_vel[:, self._leg_dof_idx] = ref["joint_vel"]
 
-        # 基座位姿：参考高度 + 参考俯仰（R_wb = Ry(base_pitch)，四元数 wxyz）
+        # 基座位姿：参考高度；朝向沿用 default_root_pose（与非 RSI env / 路线 A spawn 一致）。
+        # 注意：不要手工覆盖 root_pose[:,3:7] 四元数——诊断实测该手写 (cos,0,sin,0) 会把 90%
+        # 的 RSI env 一进 reset 就翻成 >49° 倾倒(proj_g_z→+1，绕X翻 180°)，随即被 not_upright
+        # 判定成片摔倒。根因是这里 root_pose 四元数的存储顺序与手写假设不一致（cfg
+        # init rot=(0,0,0,1) 即单位四元数 → 该管线按 xyzw 存），且手写还丢弃了 default 朝向。
+        # 参考 base_pitch 仅 ±5°，对 RSI 可忽略（前倾姿态由 imit_orient 奖励在 episode 中学到），
+        # 直接保留 default 朝向即可保证正立且方向正确。
         root_pose = self.robot.data.default_root_pose.torch[rsi_ids].clone()
         root_pose[:, :3] = self.scene.env_origins[rsi_ids]
         root_pose[:, 2] += ref["base_height"]
-        half = 0.5 * ref["base_pitch"]
-        root_pose[:, 3] = torch.cos(half)
-        root_pose[:, 4] = 0.0
-        root_pose[:, 5] = torch.sin(half)
-        root_pose[:, 6] = 0.0
         # 基座速度：参考 body 系线速度（reset 时 yaw=0，body≈world）+ 命令 yaw 角速度
         root_vel = self.robot.data.default_root_vel.torch[rsi_ids].clone()
         root_vel[:, :3] = ref["lin_vel_b"]
