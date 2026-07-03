@@ -302,6 +302,13 @@ class OceanisaaclabEnv(DirectRLEnv):
             + (tilt_rate - self.cfg.instability_tilt_rate_thresh) / self.cfg.instability_tilt_rate_thresh
         )
         instability = torch.sigmoid(self.cfg.instability_sharpness * gate_arg)
+        # With random pushes disabled, "instability" only ever reflects the policy's own
+        # wobble. Feeding that back into the gates lets a zero-command policy shuffle to
+        # dodge the stand-still/anti-jitter penalties AND collect stepping rewards. Zeroing
+        # it here makes stand_command stance fully constrained (planted feet, max smoothing,
+        # no stepping reward). Re-enable when training with pushes again.
+        if not self.cfg.enable_instability_gate:
+            instability = torch.zeros_like(instability)
 
         total_reward, reward_terms = compute_rewards(
             self.cfg.rew_scale_alive,

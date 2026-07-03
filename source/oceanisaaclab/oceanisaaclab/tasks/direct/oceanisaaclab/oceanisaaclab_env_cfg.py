@@ -151,8 +151,15 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     # - push-recovery via stepping (instability-gated, IMU-observable signals only)
     #   失衡度 = sigmoid 组合躯干倾斜 |proj_g_xy| 与倾倒角速度 |ang_vel_xy|（真机 IMU 均可得）；
     #   稳态≈0 时迈步惩罚全开（钉地不抖），失衡≈1 时解除迈步惩罚并奖励有效迈步。
-    instability_tilt_thresh = 0.15  # |proj_g_xy| 阈值（约 8.6°）：超过视为开始失衡
-    instability_tilt_rate_thresh = 1.0  # |ang_vel_xy| 阈值 [rad/s]：倾倒角速度
+    # 【2026-07-02 迭代】先前完全关闭该 gate（instability 恒 0）→ 训练里零命令硬钉脚不踏步、
+    #   fall=0.23 极低，但 sim2sim 进 RL 一踏步就摔：关掉 gate = 零命令完全无迈步恢复能力，
+    #   训练分布内不摔，但 sim2sim gap 扰动下策略硬撑救不回来。结论：失衡迈步恢复是必要鲁棒性，
+    #   不能全关；先前踏步的真正病因是阈值太敏感（tilt 0.15≈8.6°，正常动态晃就触发解锁踏步）。
+    #   改法：重开 gate，但把阈值调迟钝——只有明显失衡(tilt 0.28≈16°/rate 2.5)才解锁迈步，
+    #   稳态微晃 instability≈0 仍硬钉脚不踏步。兼顾"零命令不踏步"+"真失衡能迈步救回不摔"。
+    enable_instability_gate = True
+    instability_tilt_thresh = 0.28  # |proj_g_xy| 阈值（约 16°）：明显前/侧倾才算失衡（原 0.15≈8.6° 太敏感，正常动态晃就触发）
+    instability_tilt_rate_thresh = 2.5  # |ang_vel_xy| 阈值 [rad/s]：只有快速倾倒才算（原 1.0，正常迈步微调就能达到）
     instability_sharpness = 8.0  # sigmoid 陡度（越大越接近硬阈值）
     # - reward scales
     rew_scale_alive = 0.5  # 降低站立类正奖励占比，避免站着不动主导 return
