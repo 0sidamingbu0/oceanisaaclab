@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 from collections.abc import Sequence
 
@@ -56,6 +57,9 @@ class OceanisaaclabEnv(DirectRLEnv):
         self._default_leg_joint_pos = self.robot.data.default_joint_pos.torch[:, self._leg_dof_idx].clone()
         self._soft_leg_joint_pos_limits = self.robot.data.soft_joint_pos_limits.torch[:, self._leg_dof_idx].clone()
         self._default_neck_joint_pos = self.robot.data.default_joint_pos.torch[:, self._neck_dof_idx].clone()
+        # per-env domain randomization (mass / friction / PD gains), sampled once at startup
+        if self.cfg.enable_domain_rand:
+            self._apply_domain_randomization()
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
@@ -82,6 +86,63 @@ class OceanisaaclabEnv(DirectRLEnv):
                 "contact_force_rate",
             ]
         }
+
+    def _apply_domain_randomization(self) -> None:
+        """Per-env physical-parameter randomization, sampled once at startup.
+
+        sim2sim showed the policy falling on the first step despite fall=0.23 in
+        training — the classic symptom of missing domain randomization (only obs
+        noise + action latency were randomized before). Each env gets a fixed
+        random mass / friction / PD-gain draw; with thousands of envs the policy
+        sees the whole distribution every rollout.
+        """
+        from isaaclab.actuators import ImplicitActuator
+
+        all_env_ids = torch.arange(self.num_envs, dtype=torch.int32, device=self.device)
+        # 1) body masses: scale every link mass by a single per-env factor.
+        lo, hi = self.cfg.dr_mass_scale_range
+        mass_data = self.robot.data.body_mass if hasattr(self.robot.data, "body_mass") else self.robot.data.default_mass
+        default_mass = mass_data.torch.clone()
+        mass_scale = sample_uniform(lo, hi, (self.num_envs, 1), self.device)
+        body_ids = torch.arange(self.robot.num_bodies, dtype=torch.int32, device=self.device)
+        self.robot.set_masses_index(
+            masses=(default_mass * mass_scale).contiguous(),
+            body_ids=body_ids,
+            env_ids=all_env_ids,
+        )
+        # 2) PD gains: independent per-env/per-joint stiffness and damping factors.
+        lo, hi = self.cfg.dr_pd_gain_scale_range
+        for actuator in self.robot.actuators.values():
+            joint_indices = actuator.joint_indices
+            if isinstance(joint_indices, slice):
+                joint_indices = torch.arange(self.robot.num_joints, device=self.device)
+            stiffness = actuator.stiffness * sample_uniform(lo, hi, actuator.stiffness.shape, self.device)
+            damping = actuator.damping * sample_uniform(lo, hi, actuator.damping.shape, self.device)
+            actuator.stiffness[:] = stiffness
+            actuator.damping[:] = damping
+            if isinstance(actuator, ImplicitActuator):
+                self.robot.write_joint_stiffness_to_sim_index(
+                    stiffness=stiffness,
+                    joint_ids=joint_indices.to(dtype=torch.int32),
+                    env_ids=all_env_ids,
+                )
+                self.robot.write_joint_damping_to_sim_index(
+                    damping=damping,
+                    joint_ids=joint_indices.to(dtype=torch.int32),
+                    env_ids=all_env_ids,
+                )
+        # 3) contact friction: scale static/dynamic friction of every collision shape
+        #    by a per-env factor (requires the PhysX view; skipped with a warning on
+        #    backends that do not expose it).
+        physx_view = getattr(self.robot, "root_physx_view", None)
+        if physx_view is not None:
+            lo, hi = self.cfg.dr_friction_scale_range
+            materials = physx_view.get_material_properties()
+            friction_scale = sample_uniform(lo, hi, (materials.shape[0], 1, 1), materials.device)
+            materials[..., :2] = materials[..., :2] * friction_scale
+            physx_view.set_material_properties(materials, torch.arange(self.num_envs))
+        else:
+            print("[WARN] domain rand: robot has no root_physx_view; skipping friction randomization.")
 
     def _find_joint_ids(self, joint_names: Sequence[str]) -> list[int]:
         joint_ids = []
@@ -244,6 +305,20 @@ class OceanisaaclabEnv(DirectRLEnv):
         joint_vel = self.robot.data.joint_vel.torch[:, self._leg_dof_idx]
         phase = self._gait_phase()
         gait_clock = torch.stack((torch.sin(2.0 * torch.pi * phase), torch.cos(2.0 * torch.pi * phase)), dim=1)
+        # Silence the gait clock for zero-velocity commands. The clock used to tick
+        # unconditionally, so a standing policy kept seeing "time to step" oscillations
+        # while stand_still penalized stepping — the structural cause of the recurring
+        # zero-command marching. BDX-style setups clamp the reference/phase to stance at
+        # zero command; here the (0, 0) clock is a distinct "stance" signal.
+        moving_mask = (
+            torch.max(torch.abs(self._commands[:, :2]), dim=1).values > self.cfg.move_command_threshold
+        ) | (torch.abs(self._commands[:, 2]) > self.cfg.move_command_threshold)
+        gait_clock = gait_clock * moving_mask.float().unsqueeze(1)
+        # both-feet contact booleans: available on the real robot via foot switches and
+        # a big help for gait-phase alignment (matches the BDX observation set).
+        feet_contact = (
+            self.contact_sensor.data.current_contact_time.torch[:, self._feet_contact_ids] > 0.0
+        ).float()
 
         if self.cfg.enable_obs_noise:
             ang_vel = ang_vel + torch.randn_like(ang_vel) * self.cfg.noise_ang_vel
@@ -257,6 +332,7 @@ class OceanisaaclabEnv(DirectRLEnv):
                 proj_g,
                 self._commands * self._command_scale,
                 gait_clock,
+                feet_contact,
                 joint_pos * self.cfg.dof_pos_scale,
                 joint_vel * self.cfg.dof_vel_scale,
                 self._actions,
@@ -340,6 +416,7 @@ class OceanisaaclabEnv(DirectRLEnv):
             self.cfg.ang_vel_track_sigma,
             self.cfg.gait_duty_factor,
             self.cfg.forward_vx_sign,
+            self.cfg.walk_lean_angle,
             self.robot.data.root_pos_w.torch[:, 2],
             self._commands,
             self._gait_phase(),
@@ -401,6 +478,11 @@ class OceanisaaclabEnv(DirectRLEnv):
             (len(env_ids),),
             self.device,
         )
+        # snap sub-threshold vx samples to exactly 0 so the low-speed end of the range
+        # keeps a crisp stance/move semantic (commands below the threshold are treated
+        # as stance by the reward gates anyway).
+        small_vx = torch.abs(self._commands[env_ids, 0]) < self.cfg.move_command_threshold
+        self._commands[env_ids[small_vx], 0] = 0.0
         non_standing = torch.ones(len(env_ids), dtype=torch.bool, device=self.device)
         standing = torch.rand(len(env_ids), device=self.device) < self.cfg.stand_still_prob
         self._commands[env_ids[standing], 0] = 0.0
@@ -414,6 +496,18 @@ class OceanisaaclabEnv(DirectRLEnv):
         backward = (torch.rand(len(env_ids), device=self.device) < self.cfg.backward_prob) & moving
         self._commands[env_ids[backward], 0] *= -1.0
         moving_or_turning = ~standing
+        # Lateral vy command for every non-standing env: this robot has no ankle roll,
+        # so lateral stability can only come from hip roll + stepping — it must be
+        # explicitly trained (vy used to be always 0 and unconditionally penalized,
+        # making sim2sim lateral inputs out-of-distribution → "left key falls").
+        vy_cmd = sample_uniform(
+            self.cfg.command_vy_range[0],
+            self.cfg.command_vy_range[1],
+            (len(env_ids),),
+            self.device,
+        )
+        vy_cmd[torch.abs(vy_cmd) < self.cfg.move_command_threshold] = 0.0
+        self._commands[env_ids[moving_or_turning], 1] = vy_cmd[moving_or_turning]
         self._commands[env_ids[moving_or_turning], 2] = sample_uniform(
             self.cfg.command_wz_range[0],
             self.cfg.command_wz_range[1],
@@ -462,6 +556,8 @@ class OceanisaaclabEnv(DirectRLEnv):
         # head-forward = forward_vx_sign * body-x; at reset yaw≈0 so world-x ≈ body-x.
         # vx_seed carries the command sign, so backward commands seed a backward velocity.
         default_root_vel[seeded, 0] = self.cfg.forward_vx_sign * vx_seed[seeded]
+        # same convention for the lateral command (head-left = forward_vx_sign * body-y)
+        default_root_vel[seeded, 1] = self.cfg.forward_vx_sign * self._commands[env_ids, 1][seeded]
 
         self.robot.write_root_pose_to_sim_index(root_pose=default_root_pose, env_ids=env_ids)
         self.robot.write_root_velocity_to_sim_index(root_velocity=default_root_vel, env_ids=env_ids)
@@ -512,6 +608,7 @@ def compute_rewards(
     ang_vel_track_sigma: float,
     gait_duty_factor: float,
     forward_vx_sign: float,
+    walk_lean_angle: float,
     base_height: torch.Tensor,
     commands: torch.Tensor,
     gait_phase: torch.Tensor,
@@ -536,56 +633,68 @@ def compute_rewards(
     # recovery samples must be free to move the feet, otherwise the optimal policy
     # becomes planted-foot leaning or tiny shuffling.
     stability = 1.0 - instability
-    command_norm = torch.maximum(torch.abs(commands[:, 0]), torch.abs(commands[:, 2]))
+    command_norm = torch.max(torch.abs(commands), dim=1).values
     moving_command = (command_norm > move_command_threshold).float()
     stand_command = 1.0 - moving_command
     stepping_gate = torch.maximum(moving_command, instability)
     stable_stand_gate = stand_command * stability
 
-    # Directional-progress gate. For a translating (vx) command of either sign, gait-shaping
-    # rewards are scaled by how much of the commanded speed is actually realized IN THE
-    # COMMANDED DIRECTION: fwd_frac in [0,1] is 0 for a robot marching in place (vx≈0) and 1
-    # at/above commanded speed. This kills the "march in place" local optimum — stepping only
+    # Directional-progress gate. For a planar (vx/vy) command, gait-shaping rewards are
+    # scaled by how much of the commanded speed is actually realized IN THE COMMANDED
+    # DIRECTION: fwd_frac in [0,1] is 0 for a robot marching in place and 1 at/above
+    # commanded speed. This kills the "march in place" local optimum — stepping only
     # pays if it produces motion the right way. Non-translating commands (turn-in-place /
     # stance) keep gate=1 so their turning/gait rewards are unaffected; and instability lifts
     # the gate so push-recovery stepping is never gated.
-    vx_cmd = commands[:, 0]
-    vx_cmd_sign = torch.sign(vx_cmd)
-    vx_cmd_abs = torch.abs(vx_cmd)
-    # Head-forward speed. URDF base_link +x points to the robot's tail (head faces -x),
-    # so measured body-x velocity must be sign-corrected before comparing against the
-    # forward command. Without this the policy learns to walk backwards relative to the
-    # head (the 07-01 "W walks backwards / S falls forward" bug).
-    vx_act = forward_vx_sign * root_lin_vel_b[:, 0]
-    forward_command = (vx_cmd_abs > move_command_threshold).float()
-    # vx_act * vx_cmd_sign projects realized speed onto the commanded direction: positive when
-    # moving the commanded way (forward OR backward), negative when moving opposite → clamped
-    # to 0. Divide by the command magnitude, not the signed command, so the epsilon guard works
-    # for negative commands too.
-    fwd_frac = torch.clamp((vx_act * vx_cmd_sign) / torch.clamp(vx_cmd_abs, min=1e-3), 0.0, 1.0)
+    # Head-frame planar velocity. URDF base_link +x points to the robot's tail (head
+    # faces -x), so both body-x and body-y velocities must be sign-corrected (a 180° yaw
+    # flip negates both) before comparing against the head-frame command. Without this
+    # the policy learns to walk backwards relative to the head (the 07-01 "W walks
+    # backwards / S falls forward" bug).
+    cmd_planar = commands[:, :2]
+    act_planar = forward_vx_sign * root_lin_vel_b[:, :2]
+    cmd_planar_norm = torch.norm(cmd_planar, dim=1)
+    forward_command = (cmd_planar_norm > move_command_threshold).float()
+    # project realized planar velocity onto the commanded direction: positive when moving
+    # the commanded way, negative when moving opposite → clamped to 0. Divide by the
+    # command magnitude so fwd_frac hits 1 at/above the commanded speed.
+    along_cmd = torch.sum(act_planar * cmd_planar, dim=1) / torch.clamp(cmd_planar_norm, min=1e-3)
+    fwd_frac = torch.clamp(along_cmd / torch.clamp(cmd_planar_norm, min=1e-3), 0.0, 1.0)
     fwd_gate = torch.where(forward_command > 0.5, fwd_frac, torch.ones_like(fwd_frac))
     progress_pay = torch.maximum(fwd_gate, instability)
 
     rew_alive = rew_scale_alive * (1.0 - reset_terminated.float())
     rew_termination = rew_scale_terminated * reset_terminated.float()
-    rew_upright = rew_scale_upright * torch.exp(-4.0 * torch.sum(torch.square(projected_gravity_b[:, :2]), dim=1))
+    # Upright with a nominal forward lean while moving. The BDX reference gait bakes a
+    # deliberate trunk pitch (go_bdx ≈8°, Open Duck mini ≈3°) because this leg (like
+    # ours) has no ankle roll and only ankle pitch: walking requires shifting weight to
+    # the front of the support polygon. The old term rewarded absolute vertical
+    # unconditionally, actively fighting that natural lean. Target projected gravity for
+    # a nose-down lean of walk_lean_angle: proj_g_x = forward_vx_sign * sin(angle)
+    # (head faces the forward_vx_sign direction along body-x); stance keeps a vertical
+    # target.
+    lean_target_x = forward_vx_sign * math.sin(walk_lean_angle) * moving_command
+    upright_err = torch.square(projected_gravity_b[:, 0] - lean_target_x) + torch.square(projected_gravity_b[:, 1])
+    rew_upright = rew_scale_upright * torch.exp(-4.0 * upright_err)
     rew_height = rew_scale_height * torch.exp(-20.0 * torch.square(base_height - target_base_height))
     # only penalize roll/pitch angular velocity (keep body steady, do not fight yaw)
     rew_ang_vel = rew_scale_ang_vel * torch.sum(torch.square(root_ang_vel_b[:, :2]), dim=1)
-    # Track vx/yaw commands. The sim2sim arrow keys map naturally to these
-    # command slots, so both must be trained and rewarded.
-    lin_vel_error = torch.square(commands[:, 0] - vx_act)
+    # Track planar (vx, vy) and yaw commands. The sim2sim arrow keys map naturally to
+    # these command slots, so all must be trained and rewarded (vy used to be excluded,
+    # leaving lateral inputs out-of-distribution).
+    lin_vel_error = torch.sum(torch.square(cmd_planar - act_planar), dim=1)
     rew_track_lin_vel = rew_scale_track_lin_vel * torch.exp(-lin_vel_error / lin_vel_track_sigma)
     ang_vel_error = torch.square(commands[:, 2] - root_ang_vel_b[:, 2])
     rew_track_ang_vel = rew_scale_track_ang_vel * torch.exp(-ang_vel_error / ang_vel_track_sigma)
-    # Linear directional-progress reward. The exp tracking term is nearly flat near vx=0,
-    # giving a weak gradient to *start* translating; this linear term pays proportionally to
-    # realized speed in the commanded direction (fwd_frac, capped at the command magnitude) so
-    # there is a constant push to move either forward or backward as commanded. Zero for stance
-    # and turn-in-place, so it cannot be farmed by marching in place.
+    # Linear directional-progress reward. The exp tracking term is nearly flat near zero
+    # speed, giving a weak gradient to *start* translating; this linear term pays
+    # proportionally to realized speed along the commanded planar direction (fwd_frac,
+    # capped at the command magnitude) so there is a constant push to move as commanded.
+    # Zero for stance and turn-in-place, so it cannot be farmed by marching in place.
     rew_progress = rew_scale_progress * fwd_frac * forward_command
-    # suppress non-commanded lateral motion (vy). Yaw is handled by tracking.
-    rew_lateral = rew_scale_lateral * torch.square(root_lin_vel_b[:, 1])
+    # penalize deviation of lateral speed from the vy command (was an unconditional vy²
+    # penalty, which conflicted with training lateral commands). Head-frame vy.
+    rew_lateral = rew_scale_lateral * torch.square(commands[:, 1] - act_planar[:, 1])
     rew_joint_pos = rew_scale_joint_pos * torch.sum(torch.square(joint_pos_error), dim=1)
     # Smoothness remains strict for stable standing but is relaxed further while walking.
     motion_smooth_weight = 0.2 + 0.8 * stable_stand_gate
