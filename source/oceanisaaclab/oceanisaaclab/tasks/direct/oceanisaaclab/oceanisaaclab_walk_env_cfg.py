@@ -73,14 +73,14 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
 
     # ------------------------------------------------------------------
     # 附录 B 执行器模型（表 VI）。⚠ 参数为 Unitree A1 / Go1 辨识值——本机电机若非
-    # 同款需重新系统辨识后替换。关节类型对照论文 IV 节：
-    #   髋 roll / 髋 pitch / 膝 = A1 组（最强 34Nm）；髋 yaw / 踝 = Go1 组（23.7Nm）。
+    # 同款需重新系统辨识后替换。论文 IV 节原方案髋 roll/髋 pitch/膝用 A1（34Nm），
+    # 本机真机全部使用 Go1 电机（23.7Nm），故所有腿关节统一为 Go1 组。
     # 每关节参数元组顺序：(kP, kD, τmax, q̇τmax, q̇max, µs, µd, b_min, b_max,
     #                     εq_max, σq0, σq1, Im)
     actuator_params_a1 = (15.0, 0.6, 34.0, 7.4, 20.0, 0.45, 0.023, 0.005, 0.015, 0.02, 1.80e-4, 3.61e-5, 0.011)
     actuator_params_go1 = (10.0, 0.3, 23.7, 10.6, 28.8, 0.15, 0.016, 0.002, 0.005, 0.02, 1.89e-4, 5.47e-5, 0.0043)
     # 每条腿 5 关节的类型（"a1"/"go1"），顺序 [1髋yaw, 2髋roll, 3髋pitch, 4膝, 5踝]
-    leg_actuator_types = ("go1", "a1", "a1", "a1", "go1")
+    leg_actuator_types = ("go1", "go1", "go1", "go1", "go1")
     actuator_friction_qdot_s = 0.1  # [rad/s] 静摩擦 tanh 激活速度（论文未给，取典型值）
     actuator_backlash_tau_b = 1.0  # [Nm] 背隙 tanh 激活力矩（论文未给，取典型值）
     actuator_gain_rand_range = (0.9, 1.1)  # 每 episode kP/kD 随机化（论文：辨识区间内随机）
@@ -168,11 +168,11 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
 
     def __post_init__(self):
         # 腿执行器改为力矩直驱（stiffness/damping 置 0，PD 由附录 B 软件执行器模型
-        # 在 200Hz 内步计算并 set_joint_effort_target），力矩上限放到 A1 峰值。
+        # 在 200Hz 内步计算并 set_joint_effort_target），力矩上限放到 Go1 峰值。
         legs = self.robot_cfg.actuators["legs"]
         legs.stiffness = 0.0
         legs.damping = 0.0
-        legs.effort_limit_sim = 34.0
+        legs.effort_limit_sim = 23.7
         legs.velocity_limit_sim = 30.0
         # 脖子固定：从可控自由度移除（动作/观测本就只含腿），用高刚度位置驱动锁死默认位
         neck = self.robot_cfg.actuators["neck"]
