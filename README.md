@@ -26,14 +26,40 @@
 
 | 任务 id | 路线 | 范式 | 训练日志目录 |
 |---|---|---|---|
-| `Ocean-BDX-Stand-Direct-v0` | 路线 A | 手工塑形奖励（速度跟踪 + 步态相位 + 稳定性等 20+ 项） | `logs/rsl_rl/bdx_walk_phase/` |
-| `Ocean-BDX-Walk-Direct-v0` | 路线 B | BDX 式参考步态模仿（关节角/接触/姿态匹配为主） | `logs/rsl_rl/bdx_walk_imitation/` |
+| `Ocean-BDX-Stand-Direct-v0` | 路线 A | 手工塑形奖励（速度跟踪 + 步态相位 + 稳定性等 20+ 项），观测 41 维 | `logs/rsl_rl/bdx_walk_phase/` |
+| `Ocean-BDX-Walk-Direct-v0` | 路线 B | **BDX 论文完整复刻**（path frame + 表 I 模仿奖励 + 附录 B 执行器模型），观测 57 维 | `logs/rsl_rl/bdx_walk_imitation/` |
 
-观测 41 维（两条路线一致，sim2sim 链路通用）。本项目不装足底接触开关，观测里不含双足接触量。
+本项目不装足底接触开关，观测里不含双足接触量（接触只用于奖励）。脖子固定（高刚度锁死默认位），只训 10 个腿部电机。
 
-### 路线 B：参考步态模仿 `Ocean-BDX-Walk-Direct-v0`
+### 路线 B：BDX 论文复刻 `Ocean-BDX-Walk-Direct-v0`
 
-- 训练（从头训，观测/奖励语义与旧 checkpoint 不兼容，不 resume）：
+对照迪士尼论文《Design and Control of a Bipedal Robotic Character》（工程根目录
+`BD_X_paper.pdf`）的 periodic walking policy，核心机制：
+
+- **path frame**（论文 V-A / Fig.4）：行走按命令速度积分推进、站立收敛到双脚中心、
+  最大偏差投影拉回；速度跟踪由「躯干贴住 path 系参考位置」隐式实现，无显式速度跟踪奖励。
+- **观测 57 维**（论文式 (8) + 附录 A）：path 系躯干 xy(2) + path 系 yaw sin/cos(2)
+  + body 系线速度(3) + body 系角速度(3) + q(10) + q̇(10) + a_{t-1}(10) + a_{t-2}(10)
+  + 相位二阶谐波 sin/cos(2πφ),sin/cos(4πφ)(4) + 命令 vx,vy,wz(3)。
+  非对称 critic 额外收无噪声观测 + 摩擦/质量随机化系数（59 维）。
+- **奖励 = 论文表 I 腿部子集**（脖子固定，neck 项删除）：躯干 path 系位置/朝向、
+  body 系线/角速度 exp 核 + 腿关节角(-15·L2)/角速度 + 接触匹配 + 力矩/关节加速度/
+  动作率/动作加速度正则 + 存活 20，权重×step_dt。
+- **动作管线**（论文 V-C/V-D + 附录 A）：50Hz 策略 → 逐关节线性映射（0=标称站姿，
+  1=每关节预期范围 `action_joint_ranges`）→ 围绕实测关节角 ±τmax/kP 限幅 →
+  一阶保持插值 + 37.5Hz 低通 → 200Hz 附录 B 执行器模型。
+- **执行器模型**（附录 B / 表 VI，Unitree A1/Go1 辨识参数；髋 roll/pitch/膝=A1、
+  髋 yaw/踝=Go1；**本机电机若非同款需重新辨识**）：软件 PD + 编码器偏移 ±0.02rad +
+  tanh 摩擦 + 速度相关力矩限幅 + 背隙/速度相关噪声编码器读数 + 反射惯量 ±20%，
+  全部每 episode 重采样。
+- **扰动 = 论文表 V** 三档独立进程（髋/脚短小、盆骨长小、盆骨短大推力；大推力按整机
+  质量 ≈10/15.4 缩放为 58~97N），前 1500 iter 线性课程。
+- **相位速率 φ̇ 按命令从参考库插值**逐步积分（库默认恒定步频；`gen_reference_gait.py
+  --gait-period-fast` 可生成速度相关步频库）。
+- PPO/网络对齐论文表 IV：actor/critic 各 3×512 ELU、epoch 5、entropy 0、自适应
+  lr（KL 0.01）、batch 8192 env × 24 steps。
+
+- 训练（从头训，观测/奖励/动作语义与旧 checkpoint 全部不兼容，不 resume）：
 
     ```bash
     ./_isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py \
