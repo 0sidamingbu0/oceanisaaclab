@@ -106,6 +106,8 @@ class OceanisaaclabEnv(DirectRLEnv):
         mass_attr = "body_mass" if hasattr(self.robot.data, "body_mass") else "default_mass"
         default_mass = getattr(self.robot.data, mass_attr).torch.clone()
         mass_scale = sample_uniform(lo, hi, (self.num_envs, 1), self.device)
+        # 存下质量缩放供非对称 critic 的特权观测使用（路线 B）
+        self._dr_mass_scale = mass_scale.squeeze(1).clone()
         body_ids = torch.arange(self.robot.num_bodies, dtype=torch.int32, device=self.device)
         self.robot.set_masses_index(
             masses=(default_mass * mass_scale).contiguous(),
@@ -146,6 +148,8 @@ class OceanisaaclabEnv(DirectRLEnv):
             # PhysX tensor API requires.
             materials = wp.to_torch(physx_view.get_material_properties())
             friction_scale = sample_uniform(lo, hi, (materials.shape[0], 1, 1), materials.device)
+            # 存下摩擦缩放供非对称 critic 的特权观测使用（路线 B）
+            self._dr_friction_scale = friction_scale.view(-1).to(self.device).clone()
             materials[..., :2] = materials[..., :2] * friction_scale
             env_ids_cpu = torch.arange(self.num_envs, dtype=torch.int32)
             physx_view.set_material_properties(

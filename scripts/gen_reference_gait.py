@@ -81,6 +81,12 @@ class GaitParams:
     gait_period: float = 0.6
     """[s] 完整步态周期（左右脚各迈一步）。必须与 env cfg.gait_cycle_period 一致。"""
 
+    gait_period_fast: float = -1.0
+    """[s] 满速命令下的步态周期（BDX 论文：相位速率 φ̇ 随命令变化，走得快步频高）。
+    <=0 表示与 gait_period 相同（恒定步频）。每个命令的周期按速度占比在
+    gait_period（零速）与 gait_period_fast（满速）之间线性插值，库里存 phase_rate
+    (=1/周期) 表，训练环境按命令插值积分相位。"""
+
     gait_duty: float = 0.5
     """单脚支撑相占空比（0.5 = 支撑/摆动各半，无双支撑）。与 cfg.gait_duty_factor 一致。"""
 
@@ -270,7 +276,14 @@ def generate_command_gait(
     """
     standing = max(abs(vx), abs(vy)) < 1e-6 and abs(wz) < 1e-6
     v_base = FORWARD_VX_SIGN * np.array([vx, vy])
-    stance_time = params.gait_period * params.gait_duty
+    # 命令相关步态周期（BDX 论文：φ̇ 随命令变化）。速度占比取三轴归一化最大值，
+    # 周期在 gait_period（零速）与 gait_period_fast（满速）间线性插值。
+    period_fast = params.gait_period_fast if params.gait_period_fast > 0.0 else params.gait_period
+    speed_frac = min(
+        1.0, max(abs(vx) / params.vx_max, abs(vy) / params.vy_max, abs(wz) / params.wz_max)
+    )
+    cmd_period = params.gait_period + (period_fast - params.gait_period) * speed_frac
+    stance_time = cmd_period * params.gait_duty
     step_disp = v_base * stance_time  # 支撑相内基座平移 → 脚相对基座反向平移
     step_yaw = wz * stance_time  # 支撑相内基座偏航 → 脚相对基座反向旋转
     # 满前速时前倾 walk_lean_angle，随 vx 成比例（后退命令对称后倾）
@@ -315,21 +328,37 @@ def generate_command_gait(
         joint_pos[:] = joint_pos[0]
         feet_contact[:] = feet_contact[0]
 
-    dt = params.gait_period / n_phase
+    dt = cmd_period / n_phase
     joint_vel = (np.roll(joint_pos, -1, axis=0) - np.roll(joint_pos, 1, axis=0)) / (2.0 * dt)
     if standing:
         joint_vel[:] = 0.0
     # base 参考量（body 系）：v_body = Ry(lean) @ (v_base, 0)；proj_g = Ry(lean) @ (0,0,-1)
     lin_vel_b = rot_lean @ np.array([v_base[0], v_base[1], 0.0])
     proj_g = rot_lean @ np.array([0.0, 0.0, -1.0])
+    # body 系角速度：稳态转向时 ω_world=(0,0,wz)，ω_b = R_bw @ ω_w = rot_lean @ (0,0,wz)
+    ang_vel_b = rot_lean @ np.array([0.0, 0.0, wz])
+    # path 系躯干 xy 轨迹（BDX 论文公式 (1) 的 p_t，path frame 坐标，+x=头前向）：
+    # 生成器把脚目标在 base 系 y 方向平移 -sway(φ) ⇒ 躯干相对双脚中心（=path frame）
+    # 在 base 系 +y 偏移 +sway(φ)。head-left 轴 = FORWARD_VX_SIGN * base_y = -base_y，
+    # 故 path 系 y = -sway(φ) = +lateral_sway*sin(2πφ) 取负。x 方向本步态无前后振荡 → 0。
+    base_pos_pf = np.zeros((n_phase, 2))
+    if not standing:
+        phases = np.arange(n_phase) / n_phase
+        base_pos_pf[:, 1] = FORWARD_VX_SIGN * params.lateral_sway * np.sin(2.0 * np.pi * phases)
+    # path 系躯干偏航（相对 path frame 朝向的 yaw 振荡）：本步态不建模 → 0
+    base_yaw_pf = np.zeros(n_phase)
     return {
         "joint_pos": joint_pos,
         "joint_vel": joint_vel,
         "feet_contact": feet_contact,
         "lin_vel_b": lin_vel_b,
+        "ang_vel_b": ang_vel_b,
         "proj_g": proj_g,
+        "base_pos_pf": base_pos_pf,
+        "base_yaw_pf": base_yaw_pf,
         "base_height": base_height,
         "base_pitch": -lean,  # R_wb = Ry(base_pitch)
+        "phase_rate": 1.0 / cmd_period,
         "max_pos_err": max_pos_err,
     }
 
@@ -372,6 +401,12 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     defaults = GaitParams()
     parser.add_argument("--gait-period", type=float, default=defaults.gait_period, help="[s] 步态周期")
+    parser.add_argument(
+        "--gait-period-fast",
+        type=float,
+        default=defaults.gait_period_fast,
+        help="[s] 满速命令步态周期（<=0 = 与 --gait-period 相同，恒定步频）",
+    )
     parser.add_argument("--gait-duty", type=float, default=defaults.gait_duty, help="支撑占空比")
     parser.add_argument("--num-phase-samples", type=int, default=defaults.num_phase_samples)
     parser.add_argument(
@@ -398,6 +433,7 @@ def main() -> None:
 
     params = GaitParams(
         gait_period=args.gait_period,
+        gait_period_fast=args.gait_period_fast,
         gait_duty=args.gait_duty,
         num_phase_samples=args.num_phase_samples,
         base_height=args.base_height,
@@ -437,10 +473,14 @@ def main() -> None:
     joint_pos = np.zeros((nx, ny, nz, n_phase, 10), dtype=np.float32)
     joint_vel = np.zeros_like(joint_pos)
     feet_contact = np.zeros((nx, ny, nz, n_phase, 2), dtype=np.float32)
+    base_pos_pf = np.zeros((nx, ny, nz, n_phase, 2), dtype=np.float32)
+    base_yaw_pf = np.zeros((nx, ny, nz, n_phase), dtype=np.float32)
     lin_vel_b = np.zeros((nx, ny, nz, 3), dtype=np.float32)
+    ang_vel_b = np.zeros((nx, ny, nz, 3), dtype=np.float32)
     proj_g = np.zeros((nx, ny, nz, 3), dtype=np.float32)
     base_height_tab = np.zeros((nx, ny, nz), dtype=np.float32)
     base_pitch = np.zeros((nx, ny, nz), dtype=np.float32)
+    phase_rate = np.zeros((nx, ny, nz), dtype=np.float32)
 
     worst_err = 0.0
     for ix, vx in enumerate(vx_grid):
@@ -452,10 +492,14 @@ def main() -> None:
                 joint_pos[ix, iy, iz] = frames["joint_pos"]
                 joint_vel[ix, iy, iz] = frames["joint_vel"]
                 feet_contact[ix, iy, iz] = frames["feet_contact"]
+                base_pos_pf[ix, iy, iz] = frames["base_pos_pf"]
+                base_yaw_pf[ix, iy, iz] = frames["base_yaw_pf"]
                 lin_vel_b[ix, iy, iz] = frames["lin_vel_b"]
+                ang_vel_b[ix, iy, iz] = frames["ang_vel_b"]
                 proj_g[ix, iy, iz] = frames["proj_g"]
                 base_height_tab[ix, iy, iz] = frames["base_height"]
                 base_pitch[ix, iy, iz] = frames["base_pitch"]
+                phase_rate[ix, iy, iz] = frames["phase_rate"]
                 worst_err = max(worst_err, frames["max_pos_err"])
                 step_len = abs(vx) * params.gait_period * params.gait_duty
                 print(
@@ -476,10 +520,14 @@ def main() -> None:
         joint_pos=joint_pos,
         joint_vel=joint_vel,
         feet_contact=feet_contact,
+        base_pos_pf=base_pos_pf,
+        base_yaw_pf=base_yaw_pf,
         lin_vel_b=lin_vel_b,
+        ang_vel_b=ang_vel_b,
         proj_g=proj_g,
         base_height=base_height_tab,
         base_pitch=base_pitch,
+        phase_rate=phase_rate,
         vx_grid=vx_grid.astype(np.float32),
         vy_grid=vy_grid.astype(np.float32),
         wz_grid=wz_grid.astype(np.float32),

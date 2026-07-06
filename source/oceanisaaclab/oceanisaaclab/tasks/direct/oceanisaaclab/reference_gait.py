@@ -49,6 +49,33 @@ class ReferenceGait:
         self.gait_duty = float(data["gait_duty"])
         self.num_phase = self.joint_pos.shape[3]
         self.joint_names = [str(n) for n in data["joint_names"]]
+        # --- BDX 论文完整目标状态 x_t 的新增字段（旧库回退到兼容默认值） ---
+        # path 系躯干 xy 轨迹 (nx,ny,nz,P,2)：行走时的左右重心 sway；旧库 → 0
+        if "base_pos_pf" in data.files:
+            self.base_pos_pf = tensor("base_pos_pf")
+        else:
+            self.base_pos_pf = torch.zeros(
+                (*self.joint_pos.shape[:4], 2), dtype=torch.float32, device=self.device
+            )
+        # path 系躯干 yaw 振荡 (nx,ny,nz,P)；旧库 → 0
+        if "base_yaw_pf" in data.files:
+            self.base_yaw_pf = tensor("base_yaw_pf").unsqueeze(-1)  # (nx,ny,nz,P,1)
+        else:
+            self.base_yaw_pf = torch.zeros(
+                (*self.joint_pos.shape[:4], 1), dtype=torch.float32, device=self.device
+            )
+        # body 系角速度参考 (nx,ny,nz,3)；旧库 → 0（转向参考角速度缺失，仅影响奖励项）
+        if "ang_vel_b" in data.files:
+            self.ang_vel_b = tensor("ang_vel_b")
+        else:
+            self.ang_vel_b = torch.zeros_like(self.lin_vel_b)
+        # 命令相关相位速率 φ̇ (nx,ny,nz) [1/s]；旧库 → 恒定 1/gait_period
+        if "phase_rate" in data.files:
+            self.phase_rate = tensor("phase_rate")
+        else:
+            self.phase_rate = torch.full(
+                self.base_height.shape, 1.0 / self.gait_period, dtype=torch.float32, device=self.device
+            )
 
     @staticmethod
     def _grid_coords(values: torch.Tensor, grid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -104,8 +131,25 @@ class ReferenceGait:
             "joint_pos": lerp_phase_table(self.joint_pos),
             "joint_vel": lerp_phase_table(self.joint_vel),
             "feet_contact": lerp_phase_table(self.feet_contact),
+            "base_pos_pf": lerp_phase_table(self.base_pos_pf),
+            "base_yaw_pf": lerp_phase_table(self.base_yaw_pf).squeeze(-1),
             "lin_vel_b": lerp_table(self.lin_vel_b),
+            "ang_vel_b": lerp_table(self.ang_vel_b),
             "proj_g": lerp_table(self.proj_g),
             "base_height": lerp_table(self.base_height),
             "base_pitch": lerp_table(self.base_pitch),
+            "phase_rate": lerp_table(self.phase_rate),
         }
+
+    def sample_phase_rate(self, commands: torch.Tensor) -> torch.Tensor:
+        """仅采样相位速率 φ̇ (N,)（每步积分相位用，避免整帧采样开销）。"""
+        ix0, ix1, wx = self._grid_coords(commands[:, 0], self.vx_grid)
+        iy0, iy1, wy = self._grid_coords(commands[:, 1], self.vy_grid)
+        iz0, iz1, wz = self._grid_coords(commands[:, 2], self.wz_grid)
+        out = None
+        for cx, fx in ((ix0, 1.0 - wx), (ix1, wx)):
+            for cy, fy in ((iy0, 1.0 - wy), (iy1, wy)):
+                for cz, fz in ((iz0, 1.0 - wz), (iz1, wz)):
+                    corner = self.phase_rate[cx, cy, cz] * (fx * fy * fz)
+                    out = corner if out is None else out + corner
+        return out

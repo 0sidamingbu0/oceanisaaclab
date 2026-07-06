@@ -1,8 +1,9 @@
 """参考步态开环回放体检（路线 B）：把策略动作直接固定成参考关节角，
 验证**参考步态库本身**在物理里能否大致行走——即动力学可行性，不需要 checkpoint。
 
-原理：walk env 的动作管线是 target_joint_pos = default_leg(恒 0) + action_scale * action。
-要让 PD 目标角 == 参考帧关节角 ref_q，就令 action = (ref_q - default) / action_scale。
+原理：walk env 的动作管线是 target_joint_pos = default_leg(恒 0) + action_joint_ranges * action
+（逐关节线性映射，BDX 论文附录 A）。要让目标角 == 参考帧关节角 ref_q，就令
+action = (ref_q - default) / action_joint_ranges。
 每个控制步按 env 当前相位采样参考帧、下发为动作、步进物理，统计机器人是否真前进、
 是否站得住不摔、脚步接触时序是否贴合参考。
 
@@ -67,7 +68,8 @@ cfg.enable_action_latency = False
 env = gym.make("Ocean-BDX-Walk-Direct-v0", cfg=cfg).unwrapped
 
 dev = cfg.sim.device
-action_scale = cfg.action_scale
+# 论文版动作管线：target = default_leg(0) + action_joint_ranges * action（逐关节映射）
+joint_ranges = torch.tensor(cfg.action_joint_ranges, device=dev, dtype=torch.float32)
 fsign = cfg.forward_vx_sign
 foot_offset = cfg.foot_origin_offset
 cmd = torch.tensor([args.vx, args.vy, args.wz], device=dev, dtype=torch.float32)
@@ -81,7 +83,7 @@ default_leg = env._default_leg_joint_pos  # (N,10)，腿部 default 恒 0
 # RSI 探针：reset 之后、任何 step 之前，直接读姿态，隔离「RSI 写入是否就已倾倒」
 pg0 = env.robot.data.projected_gravity_b.torch
 h0 = env.robot.data.root_pos_w.torch[:, 2] - env.scene.env_origins[:, 2]
-tilt0 = (-pg0[:, 2] < cfg.min_upright_projection)
+tilt0 = (-pg0[:, 2] < cfg.walk_min_upright_projection)
 print("\n[RSI探针] reset 后未 step：not_upright(倾>49°) env={}/{}  "
       "base_h mean={:.3f}  -proj_g_z min={:.3f} (阈值0.65)".format(
           int(tilt0.sum()), args.num_envs, float(h0.mean()), float((-pg0[:, 2]).min())))
@@ -100,7 +102,7 @@ for t in range(args.steps):
         env._commands[:] = cmd
         phase = env._gait_phase()
         ref = env._reference_gait.sample(env._commands, phase)
-        action = (ref["joint_pos"] - default_leg) / action_scale
+        action = (ref["joint_pos"] - default_leg) / joint_ranges
         env.step(action)
         env._commands[:] = cmd
     if viz_on:
@@ -115,7 +117,7 @@ for t in range(args.steps):
         lo = env.robot.data.soft_joint_pos_limits.torch[:, env._leg_dof_idx, 0]
         hi = env.robot.data.soft_joint_pos_limits.torch[:, env._leg_dof_idx, 1]
         c_low = (rp[:, 2] < cfg.min_base_height)
-        c_tilt = (-pg[:, 2] < cfg.min_upright_projection)
+        c_tilt = (-pg[:, 2] < cfg.walk_min_upright_projection)
         c_joint = torch.any((jp < lo) | (jp > hi), dim=1)
         term_cause.append((t, int(c_low.sum()), int(c_tilt.sum()), int(c_joint.sum()), int(term.sum())))
     newly = term & ~fallen
@@ -175,7 +177,7 @@ med_surv = float(survive_steps.median()) * step_dt
 
 print("\n========== REFERENCE-GAIT OPEN-LOOP PLAYBACK (无扰动, 只统计摔前) ==========")
 print(f"command: vx={args.vx:+.3f} vy={args.vy:+.3f} wz={args.wz:+.3f}   "
-      f"envs={N}  steps={args.steps}  step_dt={step_dt:.4f}s  action_scale={action_scale}")
+      f"envs={N}  steps={args.steps}  step_dt={step_dt:.4f}s  joint_ranges={cfg.action_joint_ranges}")
 print(f"gait_period={env._reference_gait.gait_period}  gait_duty={env._reference_gait.gait_duty}")
 print("注: 双足开环关节回放本就无平衡反馈, 迟早会摔; 看的是摔前是否朝命令方向走、"
       "抬脚/接触对不对、能撑多久, 不是 fall≈0。")
@@ -220,7 +222,7 @@ if viz_on:
             with torch.inference_mode():
                 env._commands[:] = cmd
                 ref = env._reference_gait.sample(env._commands, env._gait_phase())
-                env.step((ref["joint_pos"] - default_leg) / action_scale)
+                env.step((ref["joint_pos"] - default_leg) / joint_ranges)
                 env._commands[:] = cmd
             time.sleep(float(env.step_dt))
     except KeyboardInterrupt:

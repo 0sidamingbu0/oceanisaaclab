@@ -288,9 +288,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                             dq0 = env_unwrapped.robot.data.joint_vel.torch[0, leg_ids].detach().cpu()
                             action0 = actions[0].detach().cpu()
                             clipped0 = action0.clamp(-1.0, 1.0)
+                            # 路线 B（论文版）是逐关节映射 action_joint_ranges，路线 A 是标量 action_scale
+                            ranges0 = getattr(env_unwrapped.cfg, "action_joint_ranges", None)
+                            scale0 = (
+                                torch.tensor(ranges0) if ranges0 is not None else env_unwrapped.cfg.action_scale
+                            )
                             target0 = (
                                 env_unwrapped._default_leg_joint_pos[0].detach().cpu()
-                                + env_unwrapped.cfg.action_scale * clipped0
+                                + scale0 * clipped0
                             )
                             root_pos = env_unwrapped.robot.data.root_pos_w.torch[0].detach().cpu()
                             root_lin_vel_b = env_unwrapped.robot.data.root_lin_vel_b.torch[0].detach().cpu()
@@ -325,7 +330,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                             q0 = env_unwrapped.robot.data.joint_pos.torch[0, leg_ids].detach().cpu()
                             dq0 = env_unwrapped.robot.data.joint_vel.torch[0, leg_ids].detach().cpu()
                             default0 = env_unwrapped._default_leg_joint_pos[0].detach().cpu()
-                            target0 = default0 + env_unwrapped.cfg.action_scale * clipped0
+                            ranges0 = getattr(env_unwrapped.cfg, "action_joint_ranges", None)
+                            scale0 = (
+                                torch.tensor(ranges0) if ranges0 is not None else env_unwrapped.cfg.action_scale
+                            )
+                            target0 = default0 + scale0 * clipped0
                             print(f"[debug_play] step={timestep} joint_names={joint_names}")
                             print(
                                 "[debug_play] "

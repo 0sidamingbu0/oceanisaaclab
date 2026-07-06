@@ -3,15 +3,26 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""路线 B（BDX 式参考轨迹模仿）训练环境配置。
+"""路线 B（BDX 论文完整复刻）训练环境配置。
 
-对照迪士尼 BDX 复刻（Open Duck / AWD go_bdx）的范式：奖励以「参考步态逐帧匹配」为
-主导（关节角 L2 匹配 + 接触时序匹配 + 基座姿态/高度/速度匹配），彻底删除路线 A 的
-fwd_gate / instability gate / phase_contact / swing_contact / single_support /
-feet_clearance / feet_air_time / stand_still 手工塑形联动栈——这些打地鼠问题由参考
-轨迹一次性根治。观测布局与路线 A 完全一致（41 维，无足底接触量），sim2sim 部署链路不变。
+对照迪士尼论文《Design and Control of a Bipedal Robotic Character》(RSS 2024,
+工程根目录 BD_X_paper.pdf) 的 periodic walking policy 复刻，固定脖子、只训 10 个
+腿部电机：
+
+- 观测 = 论文公式 (8) 状态 s_t + 相位二阶谐波特征 + 命令 g_peri（式 (6) 去掉头部命令）：
+  path 系躯干 xy(2) + path 系 yaw sin/cos(2) + body 系线速度(3) + body 系角速度(3)
+  + q(10) + q̇(10) + a_{t-1}(10) + a_{t-2}(10) + phase 谐波(4) + cmd(3) = 57 维。
+- 非对称 critic（附录 A）：critic 额外收无噪声观测 + 摩擦/质量随机化系数 = 59 维。
+- 奖励 = 论文表 I 腿部子集（neck 项因固定脖子删除），权重×step_dt（legged_gym 约定）。
+- path frame（V-A 节 / Fig.4）：行走按命令积分、站立收敛双脚中心、最大偏差投影。
+- 动作管线（V-C/V-D 节）：50Hz 策略 → 逐关节线性映射（0=标称站姿）→ 围绕实测关节角
+  限幅（δ=τmax/kP）→ 一阶保持插值 + 37.5Hz 低通 → 200Hz 附录 B 执行器模型
+  （软件 PD + 编码器偏移 + 摩擦 + 速度相关力矩限幅 + 背隙/噪声编码器读数 + 反射惯量）。
+- 扰动 = 论文表 V 三档独立进程（幅度按整机质量 ≈10kg/15.4kg 缩放），前 1500 iter
+  线性课程。
 """
 
+from isaaclab.sim import SimulationCfg
 from isaaclab.utils.configclass import configclass
 
 from .oceanisaaclab_env_cfg import OCEAN_ASSET_DIR, OceanisaaclabEnvCfg
@@ -19,54 +30,151 @@ from .oceanisaaclab_env_cfg import OCEAN_ASSET_DIR, OceanisaaclabEnvCfg
 
 @configclass
 class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
-    """参考模仿行走任务配置（Ocean-BDX-Walk-Direct-v0）。"""
+    """BDX 论文复刻行走任务配置（Ocean-BDX-Walk-Direct-v0）。"""
 
-    # 参考步态库（scripts/gen_reference_gait.py 生成，placo IK + meshcat 可视化；
-    # 改库参数需同步重新生成，并可用 scripts/play_reference_gait.py 播放确认）
+    # ------------------------------------------------------------------
+    # 控制频率链（论文 V-D）：策略 50Hz，低层 200Hz（论文真机 600Hz，仿真取 4 倍抽取）
+    # ------------------------------------------------------------------
+    decimation = 4
+    sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=4)
+
+    # ------------------------------------------------------------------
+    # 空间维度（改布局旧 checkpoint 全部作废）
+    # ------------------------------------------------------------------
+    action_space = 10
+    # 57 维：p_pf2 + yaw_pf(sin,cos)2 + lin_vel_b3 + ang_vel_b3 + q10 + qd10
+    #        + a_{t-1}10 + a_{t-2}10 + phase谐波4 + cmd3
+    observation_space = 57
+    # 非对称 critic：无噪声 57 维 + 摩擦系数缩放 1 + 质量缩放 1
+    state_space = 59
+
+    # ------------------------------------------------------------------
+    # 参考步态库（scripts/gen_reference_gait.py 生成；含 path 系躯干轨迹与 φ̇ 表）
+    # ------------------------------------------------------------------
     gait_library_path = str(OCEAN_ASSET_DIR / "gaits" / "reference_gait.npz")
-
-    # 参考步态基座高度 = URDF 全零姿态（BDX 标准屈膝站立，腿部有伸直角度预留）的
-    # FK 站立高度 ≈0.385m。不额外下蹲——伸直余量留给摆动/迈步。
+    # URDF 全零姿态（BDX 标准屈膝站立）FK 站立高度，不再压低
     target_base_height = 0.385
 
-    # 动作幅度：target = default_leg(0) + action_scale * action，action 天然 ~[-1,1]。
-    # 参考步态摆动关节角峰值：膝 leg_[lr]4≈0.41rad、踝 leg_[lr]5≈0.31rad、全库 abs max≈0.5rad。
-    # 基类的 0.25 只能达 ±0.25rad → 膝/踝够不到参考摆动 → 策略只能匹配小幅髋摆(身体扭)、
-    # 抬脚饱和抬不起来（实测「完全不抬脚」的根因）。放大到 0.5 让参考幅度落在 action∈[-1,1] 内
-    # （膝峰值 0.41→action 0.82，留余量给平衡修正）。仅路线 B override，不动路线 A(浅步态 0.25 够用)。
-    # ⚠ 改动作语义，须从头重训；sim2sim/onnx 部署侧 action_scale 也要同步为 0.5。
-    action_scale = 0.5
+    # ------------------------------------------------------------------
+    # path frame（论文 V-A / Fig.4）
+    # ------------------------------------------------------------------
+    path_frame_stand_time_constant = 1.0  # [s] 站立时向双脚中心收敛的一阶时间常数
+    path_frame_max_pos_deviation = 0.25  # [m] path frame 与躯干的最大位置偏差（投影拉回）
+    path_frame_max_yaw_deviation = 0.6  # [rad] 最大朝向偏差
 
-    # - 模仿奖励（正奖励为主，DeepMimic/AWD 风格 exp 核）
-    rew_scale_imit_joint_pos = 3.0  # 关节角匹配：主导项
-    imit_joint_pos_sigma = 0.4  # exp(-Σ误差²/σ)；10 关节合计均方差 ~0.04 rad² 时 ≈0.9
-    rew_scale_imit_joint_vel = 0.3  # 关节速度匹配：低权重（有限差分参考速度较噪）
-    imit_joint_vel_sigma = 40.0
-    rew_scale_imit_contact = 1.0  # 双脚接触时序匹配（0/1 参考 schedule）
-    rew_scale_imit_height = 0.5  # 基座高度匹配
-    imit_height_sigma = 2.5e-3  # exp(-Δh²/σ)；Δh=0.05m 时 ≈0.37
-    rew_scale_imit_orient = 1.0  # 基座姿态匹配（proj_g 对参考前倾姿态）
-    imit_orient_sigma = 0.05
-    # - 速度命令跟踪（与参考 base 系速度比较；权重低于关节匹配，避免拖着参考跑）
-    rew_scale_walk_track_lin_vel = 1.5
-    rew_scale_walk_track_ang_vel = 0.75
-    walk_lin_vel_track_sigma = 0.04
-    walk_ang_vel_track_sigma = 0.25
-    # - 正则项（保留少量平滑/防滑，其余交给参考匹配）
-    rew_scale_walk_alive = 0.25
-    rew_scale_walk_action_rate = -0.05
-    rew_scale_walk_feet_slide = -0.2
-    # - 参考态初始化（RSI，DeepMimic 关键技巧）：该比例的 env 直接从参考帧的关节角/
-    #   基座姿态/速度出发，episode 从步态中段开始，绕过「从静止起步」这一最难阶段
-    rsi_prob = 0.9
-    rsi_joint_pos_noise = 0.03  # [rad] RSI 关节角附加噪声
+    # ------------------------------------------------------------------
+    # 动作变换（论文附录 A：0 → 标称关节角，1 → 每关节预期活动范围）
+    # 顺序 [r1..r5, l1..l5] = [髋yaw, 髋roll, 髋pitch, 膝, 踝] × 2。
+    # 参考库摆动峰值 ≈ (0.16, 0.16, 0.41, 0.50, 0.43)，范围取 ≈2 倍留平衡余量，
+    # 超出软限位部分由 clamp 兜底。
+    action_joint_ranges = (0.35, 0.35, 0.8, 0.9, 0.8, 0.35, 0.35, 0.8, 0.9, 0.8)  # [rad]
+    # 低通滤波截止频率（论文 V-D：一阶保持插值 + 37.5Hz 低通）
+    action_lowpass_cutoff_hz = 37.5
 
-    # - 课程 override（仅路线 B）
-    # 命令幅度课程关掉：模仿范式不需要「由慢到快」的爬坡。RSI（90% env 从随机相位参考帧
-    # 出发）已绕过「从静止起步」这一最难阶段；参考库对全命令网格 vx∈{-0.25..0.25} 都有
-    # 逐帧参考、零命令点即站立帧、插值天然给出「命令→0 步幅→0」，任何速度下学习信号都
-    # 密集且良定义。开着反而前期把 vx 压在起点、高速参考帧长期见不到，拖慢高速段收敛。
+    # ------------------------------------------------------------------
+    # 附录 B 执行器模型（表 VI）。⚠ 参数为 Unitree A1 / Go1 辨识值——本机电机若非
+    # 同款需重新系统辨识后替换。论文 IV 节原方案髋 roll/髋 pitch/膝用 A1（34Nm），
+    # 本机真机全部使用 Go1 电机（23.7Nm），故所有腿关节统一为 Go1 组。
+    # 每关节参数元组顺序：(kP, kD, τmax, q̇τmax, q̇max, µs, µd, b_min, b_max,
+    #                     εq_max, σq0, σq1, Im)
+    actuator_params_a1 = (15.0, 0.6, 34.0, 7.4, 20.0, 0.45, 0.023, 0.005, 0.015, 0.02, 1.80e-4, 3.61e-5, 0.011)
+    actuator_params_go1 = (10.0, 0.3, 23.7, 10.6, 28.8, 0.15, 0.016, 0.002, 0.005, 0.02, 1.89e-4, 5.47e-5, 0.0043)
+    # 每条腿 5 关节的类型（"a1"/"go1"），顺序 [1髋yaw, 2髋roll, 3髋pitch, 4膝, 5踝]
+    leg_actuator_types = ("go1", "go1", "go1", "go1", "go1")
+    actuator_friction_qdot_s = 0.1  # [rad/s] 静摩擦 tanh 激活速度（论文未给，取典型值）
+    actuator_backlash_tau_b = 1.0  # [Nm] 背隙 tanh 激活力矩（论文未给，取典型值）
+    actuator_gain_rand_range = (0.9, 1.1)  # 每 episode kP/kD 随机化（论文：辨识区间内随机）
+    actuator_armature_rand = 0.2  # 反射惯量 ±20%（论文附录 B 末段）
+
+    # ------------------------------------------------------------------
+    # 奖励（论文表 I 腿部子集；neck 项删除）。权重按 legged_gym 约定乘 step_dt(0.02)。
+    # ------------------------------------------------------------------
+    rew_w_torso_pos_xy = 1.0  # exp(-200·‖p_pf - p̂_pf‖²)
+    rew_k_torso_pos_xy = 200.0
+    rew_w_torso_orient = 1.0  # exp(-20·‖θ ⊟ θ̂‖²)
+    rew_k_torso_orient = 20.0
+    rew_w_lin_vel_xy = 1.0  # exp(-8·‖v_xy - v̂_xy‖²)
+    rew_k_lin_vel = 8.0
+    rew_w_lin_vel_z = 1.0
+    rew_w_ang_vel_xy = 0.5  # exp(-2·‖ω_xy - ω̂_xy‖²)
+    rew_k_ang_vel = 2.0
+    rew_w_ang_vel_z = 0.5
+    rew_w_leg_joint_pos = -15.0  # -‖q - q̂‖²（负 L2，非 exp 核）
+    rew_w_leg_joint_vel = -1.0e-3
+    rew_w_contact_match = 1.0  # Σᵢ I[cᵢ = ĉᵢ]，每脚一致 +1
+    rew_w_torque = -1.0e-3
+    rew_w_joint_acc = -2.5e-6
+    rew_w_action_rate = -1.5
+    rew_w_action_acc = -0.45
+    rew_w_survival = 20.0
+
+    # ------------------------------------------------------------------
+    # 终止（论文 V-B：躯干/头触地才终止；此处用等效的高度+倾角判定，无需额外接触传感）
+    # ------------------------------------------------------------------
+    walk_min_base_height = 0.2  # [m] 低于视为躯干触地
+    walk_min_upright_projection = 0.2  # -proj_g_z 低于（倾角 >≈78°）视为倒地
+
+    # ------------------------------------------------------------------
+    # RSI（论文未用但不冲突、已验证有效；降到 0.5 观察）
+    # ------------------------------------------------------------------
+    rsi_prob = 0.5
+    rsi_joint_pos_noise = 0.03  # [rad]
+
+    # ------------------------------------------------------------------
+    # 表 V 三档扰动（每 body 独立进程）。力/矩幅值已按整机质量 ≈10kg / 论文 15.4kg
+    # （×0.65）缩放；短/小与长/小档幅值小，不缩放。前 1500 iter 线性课程
+    # （1500 iter × 24 steps = 36_000 common steps）。
+    # ------------------------------------------------------------------
+    enable_paper_disturbance = True
+    disturbance_curriculum_steps = 36_000
+    # 短/小：髋 + 脚
+    dist_small_short_bodies = ("leg_r2_link", "leg_l2_link", "leg_r5_link", "leg_l5_link")
+    dist_small_short_force_xy = (0.0, 5.0)  # [N]
+    dist_small_short_force_z = (0.0, 5.0)
+    dist_small_short_torque = (0.0, 0.25)  # [Nm]
+    dist_small_short_on_s = (0.25, 2.0)
+    dist_small_short_off_s = (1.0, 3.0)
+    # 长/小：盆骨（脖子固定，头档并入盆骨）
+    dist_small_long_bodies = ("base_link",)
+    dist_small_long_force_xy = (0.0, 5.0)
+    dist_small_long_force_z = (0.0, 5.0)
+    dist_small_long_torque = (0.0, 0.25)
+    dist_small_long_on_s = (2.0, 10.0)
+    dist_small_long_off_s = (1.0, 3.0)
+    # 短/大：盆骨。论文 [90,150]N / [0,15]Nm ×0.65 质量比
+    dist_large_bodies = ("base_link",)
+    dist_large_force_xy = (58.0, 97.0)
+    dist_large_force_z = (0.0, 6.5)
+    dist_large_torque = (0.0, 9.7)
+    dist_large_on_s = (0.1, 0.1)
+    dist_large_off_s = (12.0, 15.0)
+    # 关闭基类的单一推力机制（被表 V 扰动引擎替换）
+    enable_random_push = False
+    enable_push_curriculum = False
+
+    # ------------------------------------------------------------------
+    # 观测噪声/缩放（论文附录 A：输入按预期范围归一化；关节角噪声由附录 B 编码器
+    # 模型提供——q̂ = q̃ + 背隙 + 速度相关高斯，不再叠加独立关节角噪声）
+    # ------------------------------------------------------------------
+    pos_pf_scale = 4.0  # ≈1/max_pos_deviation
+    lin_vel_scale = 2.0
+    noise_lin_vel = 0.05  # [m/s] 真机线速度来自状态估计器，训练时加噪声覆盖估计误差
+    # ang_vel/proj_g/joint_vel 噪声沿用基类 cfg（noise_ang_vel / noise_joint_vel）
+
+    # ------------------------------------------------------------------
+    # 课程 override：模仿范式不需要命令由慢到快（RSI + 全网格参考帧，学习信号密集）
+    # ------------------------------------------------------------------
     enable_command_curriculum = False
-    # 推力课程保留（抗扰鲁棒性模仿一样需要）：但不再有命令课程走满作为锚点，且 RSI 收敛快，
-    # 把起爬点从 120_000 提前到 60_000（≈2500 iter），让抗推早点介入。
-    push_curriculum_start_step = 60_000
+
+    def __post_init__(self):
+        # 腿执行器改为力矩直驱（stiffness/damping 置 0，PD 由附录 B 软件执行器模型
+        # 在 200Hz 内步计算并 set_joint_effort_target），力矩上限放到 Go1 峰值。
+        legs = self.robot_cfg.actuators["legs"]
+        legs.stiffness = 0.0
+        legs.damping = 0.0
+        legs.effort_limit_sim = 23.7
+        legs.velocity_limit_sim = 30.0
+        # 脖子固定：从可控自由度移除（动作/观测本就只含腿），用高刚度位置驱动锁死默认位
+        neck = self.robot_cfg.actuators["neck"]
+        neck.stiffness = 50.0
+        neck.damping = 2.0
