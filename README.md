@@ -74,6 +74,36 @@
       --checkpoint logs/rsl_rl/bdx_walk_imitation/<run>/model_<iter>.pt
     ```
 
+### 路线 B 部署（sim2sim / sim2real）：命令如何控制前后左右
+
+常见误解澄清：**参考步态库只在训练时用**（算表 I 模仿奖励 + RSI 重置），参考轨迹
+**从来不进观测**，部署侧**不需要**「按 cmd 修改观测里的参考轨迹」。命令 (vx, vy, wz)
+**仍然在 57 维观测的最后 3 维**（× `command_scale=(2,2,1)`），并没有被去掉。
+
+命令通过三条通道同时作用于策略，部署程序必须全部复刻：
+
+1. **观测最后 3 维 = cmd × command_scale**：遥控器 / 上层直接写入。命令为头部系
+   （vx 头前向 +、vy 头左向 +、wz 逆时针 +，单位 m/s、rad/s），训练范围
+   vx∈[-0.25,0.25]、vy∈[-0.15,0.15]、wz∈[-0.8,0.8]，部署侧应同样限幅。
+2. **path frame 按 cmd 积分** → 观测第 1~4 维（path 系躯干 xy×`pos_pf_scale=4.0`、
+   相对 yaw 的 sin/cos）。逐行为复刻 `path_frame.py`（纯 torch，可直接翻 numpy）：
+   - `|cmd|` 任一分量 > `move_command_threshold=0.08` → 行走分支：path frame 位置
+     按命令速度（先旋到世界系）× dt 积分，yaw 按 wz × dt 积分；
+   - 否则站立分支：一阶低通（时间常数 1.0s）收敛到**双脚中心 xy** 与当前躯干 yaw
+     （需要里程计/状态估计给出躯干世界位姿；双脚中心可用 FK 从关节角+躯干位姿算）；
+   - 每步最后做最大偏差投影：位置偏差钳到 0.25m、yaw 偏差钳到 0.6rad。
+   - dt = 策略周期 0.02s（50Hz），与训练一致。
+   速度跟踪就是这样隐式实现的：path frame 以命令速度跑，策略只有贴住它才有奖励，
+   所以推 cmd_vx>0 就是把参考锚点向头前方移动，策略自然向前走。
+3. **相位 φ 按 φ̇(cmd) 积分** → 观测相位 4 维（sin/cos(2πφ), sin/cos(4πφ)）。
+   φ̇ 从 npz 库的 `phase_rate` 表按 cmd 三线性插值（复刻 `reference_gait.py` 的
+   `sample_phase_rate`，网格 vx 5 点 / vy 3 点 / wz 5 点；恒定步频库退化为常数
+   1/gait_period）。每策略步 φ ← (φ + φ̇·0.02) mod 1。零命令时相位照常推进
+   （与训练一致，参考在零命令网格点本来就是常量站立帧）。
+
+部署侧唯一需要从 `reference_gait.npz` 读取的就是 `phase_rate` + 三根网格轴
+（`vx_grid/vy_grid/wz_grid`）；`joint_pos` 等轨迹表不用加载。
+
 ### 路线 A：手工塑形 `Ocean-BDX-Stand-Direct-v0`
 
 ```bash
