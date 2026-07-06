@@ -89,8 +89,10 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     # ------------------------------------------------------------------
     # 奖励（论文表 I 腿部子集；neck 项删除）。权重按 legged_gym 约定乘 step_dt(0.02)。
     # ------------------------------------------------------------------
-    rew_w_torso_pos_xy = 1.0  # exp(-200·‖p_pf - p̂_pf‖²)
-    rew_k_torso_pos_xy = 200.0
+    rew_w_torso_pos_xy = 1.0  # exp(-k·‖p_pf - p̂_pf‖²)
+    # 论文原值 200，但核太陡（位置差 0.09m 即 exp≈0.2）→ path 位置跟踪梯度稀疏，
+    # 策略够不着迈步信号、退回站立局部最优。放平到 60（0.15m 偏差仍有 ≈0.26 梯度）。
+    rew_k_torso_pos_xy = 60.0
     rew_w_torso_orient = 1.0  # exp(-20·‖θ ⊟ θ̂‖²)
     rew_k_torso_orient = 20.0
     rew_w_lin_vel_xy = 1.0  # exp(-8·‖v_xy - v̂_xy‖²)
@@ -106,7 +108,10 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     rew_w_joint_acc = -2.5e-6
     rew_w_action_rate = -1.5
     rew_w_action_acc = -0.45
-    rew_w_survival = 20.0
+    # 论文原值 20，依赖强密集模仿信号才不吞掉任务梯度；本工程信号稀疏时它占了总回报
+    # 约 93%（3000 iter 实测），策略只需"别摔"就锁定回报、退回站立局部最优。降到 5
+    # 仍抑制"主动摔"，但不再压倒 path 位置/朝向跟踪。见 memory ocean-walk-standing-local-optimum。
+    rew_w_survival = 5.0
 
     # ------------------------------------------------------------------
     # 终止（论文 V-B：躯干/头触地才终止；此处用等效的高度+倾角判定，无需额外接触传感）

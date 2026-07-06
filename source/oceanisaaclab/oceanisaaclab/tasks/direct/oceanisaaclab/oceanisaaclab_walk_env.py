@@ -280,9 +280,11 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
                 self._warned_no_armature = True
             return
         try:
-            writer(armature.contiguous(), joint_ids=joint_ids, env_ids=env_ids.to(dtype=torch.int32))
+            # 新 API（write_joint_armature_to_sim_index）：armature 为关键字专用参数
+            writer(armature=armature.contiguous(), joint_ids=joint_ids, env_ids=env_ids.to(dtype=torch.int32))
         except TypeError:
-            writer(armature.contiguous(), joint_ids=self._leg_dof_idx, env_ids=env_ids)
+            # 旧 API（deprecated write_joint_armature_to_sim）：armature 可位置或关键字
+            writer(armature=armature.contiguous(), joint_ids=self._leg_dof_idx, env_ids=env_ids)
 
     def _reset_path_frame(self, env_ids: torch.Tensor, pf_offset: torch.Tensor | None = None) -> None:
         """path frame 初始化到躯干出生位姿。reset 时朝向为 default（yaw=0 → head_yaw=offset）。
