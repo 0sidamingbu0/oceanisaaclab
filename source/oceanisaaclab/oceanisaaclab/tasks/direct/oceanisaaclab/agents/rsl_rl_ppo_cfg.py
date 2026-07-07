@@ -71,7 +71,10 @@ class WalkPPORunnerCfg(PPORunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.0,
+        # 论文原值 0；但 07-07 复盘发现 5800 iter 时 mean_std 从 init 0.3 塌到 0.013、
+        # entropy -29，在发现"迈步比站着值"之前探索就死了、锁死站立局部最优。
+        # 加小 entropy_coef 恢复逃出盆地的能力（值取小以防重新引入不稳定）。
+        entropy_coef=0.005,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=3.0e-4,

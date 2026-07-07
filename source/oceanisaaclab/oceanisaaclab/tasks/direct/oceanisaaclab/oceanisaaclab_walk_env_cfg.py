@@ -92,7 +92,10 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     rew_w_torso_pos_xy = 1.0  # exp(-k·‖p_pf - p̂_pf‖²)
     # 论文原值 200，但核太陡（位置差 0.09m 即 exp≈0.2）→ path 位置跟踪梯度稀疏，
     # 策略够不着迈步信号、退回站立局部最优。放平到 60（0.15m 偏差仍有 ≈0.26 梯度）。
-    rew_k_torso_pos_xy = 60.0
+    # 07-07 复盘（5800 iter 仍站立蹭走）：k=60 时 anchor 跑到 0.25m 钳位处 exp≈0.024≈0，
+    # 动的 env（约 64%）拿不到前进梯度、只有站立 env 在拿分。再放平到 30
+    # （0.25m 处仍有 exp≈0.15 实梯度），给前进 env 追 anchor 的理由。
+    rew_k_torso_pos_xy = 30.0
     rew_w_torso_orient = 1.0  # exp(-20·‖θ ⊟ θ̂‖²)
     rew_k_torso_orient = 20.0
     rew_w_lin_vel_xy = 1.0  # exp(-8·‖v_xy - v̂_xy‖²)
@@ -101,9 +104,15 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     rew_w_ang_vel_xy = 0.5  # exp(-2·‖ω_xy - ω̂_xy‖²)
     rew_k_ang_vel = 2.0
     rew_w_ang_vel_z = 0.5
-    rew_w_leg_joint_pos = -15.0  # -‖q - q̂‖²（负 L2，非 exp 核）
+    # 07-07 第二轮：改动 1(k30/survival2/entropy0.005)训到 7000 iter 探索保住了
+    # （mean_std 稳在 0.044 未崩），但站立盆地仍未破：torso_pos_xy 平在 0.51、
+    # contact_match 死平 1.20（双脚常着地）、leg_joint_pos 一度升到 -0.55 又回落。
+    # 站着能拿的正分仍压过迈步的摔倒风险。加大此项到 -25，直接逼出摆腿轨迹。
+    rew_w_leg_joint_pos = -25.0  # -‖q - q̂‖²（负 L2，非 exp 核）
     rew_w_leg_joint_vel = -1.0e-3
-    rew_w_contact_match = 1.0  # Σᵢ I[cᵢ = ĉᵢ]，每脚一致 +1
+    # 07-07 第二轮：双脚常着地白拿 1.20（满分 2）。加大到 1.5，让"不迈步的接触模式"
+    # 相对收益下降，配合 leg_joint_pos 一起把站立盆地垫低。
+    rew_w_contact_match = 1.5  # Σᵢ I[cᵢ = ĉᵢ]，每脚一致 +1
     rew_w_torque = -1.0e-3
     rew_w_joint_acc = -2.5e-6
     rew_w_action_rate = -1.5
@@ -111,7 +120,9 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     # 论文原值 20，依赖强密集模仿信号才不吞掉任务梯度；本工程信号稀疏时它占了总回报
     # 约 93%（3000 iter 实测），策略只需"别摔"就锁定回报、退回站立局部最优。降到 5
     # 仍抑制"主动摔"，但不再压倒 path 位置/朝向跟踪。见 memory ocean-walk-standing-local-optimum。
-    rew_w_survival = 5.0
+    # 07-07 复盘：降到 5 后 survival 仍是前进项 torso_pos_xy 的约 11 倍、依旧主导，
+    # 再降到 2 继续削站立盆地。
+    rew_w_survival = 2.0
 
     # ------------------------------------------------------------------
     # 终止（论文 V-B：躯干/头触地才终止；此处用等效的高度+倾角判定，无需额外接触传感）
@@ -120,9 +131,11 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     walk_min_upright_projection = 0.2  # -proj_g_z 低于（倾角 >≈78°）视为倒地
 
     # ------------------------------------------------------------------
-    # RSI（论文未用但不冲突、已验证有效；降到 0.5 观察）
+    # RSI（论文未用但不冲突、已验证有效）
+    # 07-07 第二轮：从参考迈步中途（且在移动）起步的 env 越多，越能亲身体验
+    # "追上 anchor = 拿高分"、模仿信号越密。论文重度依赖 RSI。0.5→0.8 破站立盆地。
     # ------------------------------------------------------------------
-    rsi_prob = 0.5
+    rsi_prob = 0.8
     rsi_joint_pos_noise = 0.03  # [rad]
 
     # ------------------------------------------------------------------
