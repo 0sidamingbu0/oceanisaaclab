@@ -74,7 +74,10 @@ class WalkPPORunnerCfg(PPORunnerCfg):
         # 论文原值 0；但 07-07 复盘发现 5800 iter 时 mean_std 从 init 0.3 塌到 0.013、
         # entropy -29，在发现"迈步比站着值"之前探索就死了、锁死站立局部最优。
         # 加小 entropy_coef 恢复逃出盆地的能力（值取小以防重新引入不稳定）。
-        entropy_coef=0.005,
+        # 07-08：加脖子(14-DOF)后 13000 iter 腿动作 std 塌到 0.044（加脖子前同期 0.066）、
+        # 探索死得更早锁进蹭步局部最优（见 memory ocean-neck-walk-gait-regression）。配合头命令
+        # 课程，把 entropy_coef 0.005→0.008 作保险，延长关键步态涌现期的探索（仍取小防失稳）。
+        entropy_coef=0.008,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=3.0e-4,

@@ -72,6 +72,11 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     head_command_roll_range = (-0.6, 0.6)  # [rad] 歪头
     # 头命令 obs 缩放（dh 量级小，放大到与其它命令可比；obs_normalization 亦会归一）
     head_command_scale = (20.0, 1.0, 1.0, 1.0)
+    # 头命令课程（07-08 复盘：脖子直接满范围进 RL 使前进步态退化——歪头/扭头=base 顶非对称
+    # 质量偏置，早期把对称参考步态带偏，策略退回蹭步、torso_orient/pos/contact 全塌，见 memory
+    # ocean-neck-walk-gait-regression）。头命令采样范围按 common_step_counter 从 0 线性放开到满
+    # 范围，让腿步态先长熟再引入头部扰动。0→满：5000 iter × 24 steps/env = 120_000 common steps。
+    head_command_curriculum_steps = 120_000
 
     # ------------------------------------------------------------------
     # path frame（论文 V-A / Fig.4）

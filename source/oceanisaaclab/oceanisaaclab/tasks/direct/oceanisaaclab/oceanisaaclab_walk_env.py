@@ -651,11 +651,15 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         self._filtered_joint_target[env_ids] = self._default_leg_joint_pos[env_ids]
         self._last_tau_m[env_ids] = 0.0
         self._applied_leg_torque[env_ids] = 0.0
-        # 头部命令：每 env 采样 4-DOF (Δh, pitch, yaw, roll)，整段 episode 恒定
-        self._head_commands[env_ids, 0] = sample_uniform(*self.cfg.head_command_dh_range, (n,), self.device)
-        self._head_commands[env_ids, 1] = sample_uniform(*self.cfg.head_command_pitch_range, (n,), self.device)
-        self._head_commands[env_ids, 2] = sample_uniform(*self.cfg.head_command_yaw_range, (n,), self.device)
-        self._head_commands[env_ids, 3] = sample_uniform(*self.cfg.head_command_roll_range, (n,), self.device)
+        # 头部命令：每 env 采样 4-DOF (Δh, pitch, yaw, roll)，整段 episode 恒定。
+        # 课程：采样范围按 common_step_counter 从 0 线性放开到满范围（见 cfg
+        # head_command_curriculum_steps）。范围对称于 0，乘 hscale 即绕 0 收缩，
+        # hscale=0 时头命令全 0（脖子停在默认位）→ 腿步态先在无头部扰动下长熟。
+        hscale = min(1.0, self.common_step_counter / float(self.cfg.head_command_curriculum_steps))
+        self._head_commands[env_ids, 0] = hscale * sample_uniform(*self.cfg.head_command_dh_range, (n,), self.device)
+        self._head_commands[env_ids, 1] = hscale * sample_uniform(*self.cfg.head_command_pitch_range, (n,), self.device)
+        self._head_commands[env_ids, 2] = hscale * sample_uniform(*self.cfg.head_command_yaw_range, (n,), self.device)
+        self._head_commands[env_ids, 3] = hscale * sample_uniform(*self.cfg.head_command_roll_range, (n,), self.device)
         # 脖子位置目标复位到该头命令对应的参考角（避免第一步从默认位跳变）
         neck_ref_reset = self._neck_head_map.sample(self._head_commands[env_ids])
         self._neck_target[env_ids] = neck_ref_reset
