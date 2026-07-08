@@ -153,3 +153,44 @@ class ReferenceGait:
                     corner = self.phase_rate[cx, cy, cz] * (fx * fy * fz)
                     out = corner if out is None else out + corner
         return out
+
+
+class NeckHeadMap:
+    """脖子/头部参考映射的 torch 采样器（``scripts/gen_neck_head_map.py`` 生成）。
+
+    头部命令 4-DOF (Δh 头高, pitch 点头, yaw 摇头, roll 歪头) → 4 个脖子关节参考角
+    (neck_n1..n4)。因 base 固定时脖子与脚 IK 解耦，头姿不进步态库网格（会维度爆炸），
+    单独存这张 4D 表，运行时四线性插值给出脖子模仿奖励的目标角。纯张量、无循环。
+    """
+
+    def __init__(self, npz_path: str, device: str | torch.device):
+        data = np.load(npz_path, allow_pickle=False)
+        self.device = torch.device(device)
+
+        def tensor(name: str) -> torch.Tensor:
+            return torch.as_tensor(data[name], dtype=torch.float32, device=self.device)
+
+        self.dh_grid = tensor("dh_grid")
+        self.pitch_grid = tensor("pitch_grid")
+        self.yaw_grid = tensor("yaw_grid")
+        self.roll_grid = tensor("roll_grid")
+        self.neck_pos = tensor("neck_pos")  # (nh, npitch, nyaw, nroll, 4)
+        self.neck_joint_names = [str(n) for n in data["neck_joint_names"]]
+        self.num_neck = self.neck_pos.shape[-1]
+
+    def sample(self, head_cmd: torch.Tensor) -> torch.Tensor:
+        """按头部命令 (N,4)=(Δh, pitch, yaw, roll) 四线性插值返回脖子参考角 (N,4)。"""
+        ih0, ih1, wh = ReferenceGait._grid_coords(head_cmd[:, 0], self.dh_grid)
+        ip0, ip1, wp = ReferenceGait._grid_coords(head_cmd[:, 1], self.pitch_grid)
+        iy0, iy1, wy = ReferenceGait._grid_coords(head_cmd[:, 2], self.yaw_grid)
+        ir0, ir1, wr = ReferenceGait._grid_coords(head_cmd[:, 3], self.roll_grid)
+        out = None
+        for ch, fh in ((ih0, 1.0 - wh), (ih1, wh)):
+            for cp, fp in ((ip0, 1.0 - wp), (ip1, wp)):
+                for cy, fy in ((iy0, 1.0 - wy), (iy1, wy)):
+                    for cr, fr in ((ir0, 1.0 - wr), (ir1, wr)):
+                        weight = (fh * fp * fy * fr).unsqueeze(-1)
+                        corner = self.neck_pos[ch, cp, cy, cr]  # (N, 4)
+                        out = corner * weight if out is None else out + corner * weight
+        return out
+

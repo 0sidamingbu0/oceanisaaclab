@@ -41,12 +41,13 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     # ------------------------------------------------------------------
     # 空间维度（改布局旧 checkpoint 全部作废）
     # ------------------------------------------------------------------
-    action_space = 10
-    # 57 维：p_pf2 + yaw_pf(sin,cos)2 + lin_vel_b3 + ang_vel_b3 + q10 + qd10
-    #        + a_{t-1}10 + a_{t-2}10 + phase谐波4 + cmd3
-    observation_space = 57
-    # 非对称 critic：无噪声 57 维 + 摩擦系数缩放 1 + 质量缩放 1
-    state_space = 59
+    # 14 = 10 腿 + 4 脖子（脖子改为学习控制的位置目标，不再锁死）
+    action_space = 14
+    # 77 维：p_pf2 + yaw_pf(sin,cos)2 + lin_vel_b3 + ang_vel_b3 + q_leg10 + q_neck4
+    #        + qd_leg10 + qd_neck4 + a_{t-1}14 + a_{t-2}14 + phase谐波4 + cmd3 + head_cmd4
+    observation_space = 77
+    # 非对称 critic：无噪声 77 维 + 摩擦系数缩放 1 + 质量缩放 1
+    state_space = 79
 
     # ------------------------------------------------------------------
     # 参考步态库（scripts/gen_reference_gait.py 生成；含 path 系躯干轨迹与 φ̇ 表）
@@ -54,6 +55,23 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     gait_library_path = str(OCEAN_ASSET_DIR / "gaits" / "reference_gait.npz")
     # URDF 全零姿态（BDX 标准屈膝站立）FK 站立高度，不再压低
     target_base_height = 0.385
+
+    # ------------------------------------------------------------------
+    # 脖子/头部（论文 g_peri 的头部命令 Δh_head, Δθ_head；本机脖子 4 关节实现
+    # 4-DOF 头姿：Δh 头高 + pitch 点头 + yaw 摇头 + roll 歪头）
+    # scripts/gen_neck_head_map.py 生成头命令→脖子参考角映射表，NeckHeadMap 四线性插值。
+    # ------------------------------------------------------------------
+    neck_head_map_path = str(OCEAN_ASSET_DIR / "gaits" / "neck_head_map.npz")
+    # 脖子动作线性映射范围（0=默认位，±1→±range）；覆盖映射表参考角跨度，clamp 兜软限位。
+    # 顺序 [n1, n2, n3, n4] = [矢状 pitch/高度对 ×2, yaw, roll]
+    neck_action_joint_ranges = (0.8, 0.8, 1.2, 0.7)  # [rad]
+    # 头部命令采样范围（与 neck_head_map 网格一致）。每 env reset 均匀采样，整段 episode 恒定。
+    head_command_dh_range = (-0.02, 0.02)  # [m] 头高偏移（本机脖子高度权限弱，压到 ±2cm）
+    head_command_pitch_range = (-0.5, 0.5)  # [rad] 点头
+    head_command_yaw_range = (-1.0, 1.0)  # [rad] 摇头
+    head_command_roll_range = (-0.6, 0.6)  # [rad] 歪头
+    # 头命令 obs 缩放（dh 量级小，放大到与其它命令可比；obs_normalization 亦会归一）
+    head_command_scale = (20.0, 1.0, 1.0, 1.0)
 
     # ------------------------------------------------------------------
     # path frame（论文 V-A / Fig.4）
@@ -115,8 +133,15 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     rew_w_contact_match = 1.5  # Σᵢ I[cᵢ = ĉᵢ]，每脚一致 +1
     rew_w_torque = -1.0e-3
     rew_w_joint_acc = -2.5e-6
-    rew_w_action_rate = -1.5
-    rew_w_action_acc = -0.45
+    rew_w_action_rate = -1.5  # 腿动作率（论文表 I：leg action rate 1.5）
+    rew_w_action_acc = -0.45  # 腿动作加速度（论文：leg action acc 0.45）
+    # 脖子/头部模仿（论文表 I neck 项，脖子启用后恢复）：
+    # 脖子关节角模仿参考头姿（NeckHeadMap(head_cmd)），论文权重 100；脖子位置驱动、
+    # 轻质、与腿解耦，追踪容易，大权重不干扰腿。脖子关节速度惩罚使头姿稳定不抖。
+    rew_w_neck_joint_pos = -100.0  # -‖q_neck - q̂_neck‖²（论文 neck joint positions 100）
+    rew_w_neck_joint_vel = -1.0  # -‖q̇_neck‖²（论文 neck joint velocities 1.0；参考头姿静止）
+    rew_w_neck_action_rate = -5.0  # 论文 neck action rate 5.0
+    rew_w_neck_action_acc = -5.0  # 论文 neck action acc 5.0
     # 论文原值 20，依赖强密集模仿信号才不吞掉任务梯度；本工程信号稀疏时它占了总回报
     # 约 93%（3000 iter 实测），策略只需"别摔"就锁定回报、退回站立局部最优。降到 5
     # 仍抑制"主动摔"，但不再压倒 path 位置/朝向跟踪。见 memory ocean-walk-standing-local-optimum。
@@ -192,7 +217,9 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
         legs.damping = 0.0
         legs.effort_limit_sim = 23.7
         legs.velocity_limit_sim = 30.0
-        # 脖子固定：从可控自由度移除（动作/观测本就只含腿），用高刚度位置驱动锁死默认位
+        # 脖子：改为学习控制的位置伺服（动作后 4 维 → 脖子位置目标，追踪头部命令参考角）。
+        # 保持位置驱动（ImplicitActuator，脖子轻、位置伺服稳、sim2real 简单），高刚度使其
+        # 快速跟上学习目标。effort/velocity 上限适当放开以驱动脖子。
         neck = self.robot_cfg.actuators["neck"]
         neck.stiffness = 50.0
         neck.damping = 2.0

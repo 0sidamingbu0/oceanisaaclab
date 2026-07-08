@@ -36,7 +36,7 @@ from isaaclab.utils.math import euler_xyz_from_quat, quat_error_magnitude, quat_
 from .oceanisaaclab_env import OceanisaaclabEnv
 from .oceanisaaclab_walk_env_cfg import OceanisaaclabWalkEnvCfg
 from .path_frame import PathFrame
-from .reference_gait import ReferenceGait
+from .reference_gait import NeckHeadMap, ReferenceGait
 
 
 class _DisturbanceSchedule:
@@ -139,6 +139,23 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         self._target_joint_pos = self._default_leg_joint_pos.clone()
         self._prev_target_joint_pos = self._default_leg_joint_pos.clone()
         self._filtered_joint_target = self._default_leg_joint_pos.clone()
+
+        # ---- 脖子/头部：4 关节位置伺服跟随头部命令参考角（论文头部命令 Δh/Δθ_head） ----
+        self._neck_head_map = NeckHeadMap(self.cfg.neck_head_map_path, self.device)
+        self._neck_joint_ranges = torch.tensor(
+            self.cfg.neck_action_joint_ranges, dtype=torch.float, device=self.device
+        ).unsqueeze(0)
+        self._soft_neck_joint_pos_limits = self.robot.data.soft_joint_pos_limits.torch[
+            :, self._neck_dof_idx
+        ].clone()
+        self._neck_target = self._default_neck_joint_pos.clone()
+        self._head_commands = torch.zeros(self.num_envs, 4, device=self.device)
+        self._head_command_scale = torch.tensor(
+            self.cfg.head_command_scale, dtype=torch.float, device=self.device
+        ).unsqueeze(0)
+        # 动作切片：前 10 = 腿（力矩直驱），后 4 = 脖子（位置伺服）
+        self._leg_action_slice = slice(0, len(self._leg_dof_idx))
+        self._neck_action_slice = slice(len(self._leg_dof_idx), self.cfg.action_space)
         # 低通系数：y += α(u−y)，α = 1 − exp(−2π·f_c·dt_sim)
         self._lowpass_alpha = 1.0 - math.exp(
             -2.0 * math.pi * self.cfg.action_lowpass_cutoff_hz * self.physics_dt
@@ -237,6 +254,10 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
                 "joint_acc",
                 "action_rate",
                 "action_acc",
+                "neck_joint_pos",
+                "neck_joint_vel",
+                "neck_action_rate",
+                "neck_action_acc",
                 "survival",
             ]
         }
@@ -323,7 +344,8 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         else:
             delayed_actions = self._actions
         # 逐关节线性映射：0 → 标称关节角（全零屈膝站姿），1 → 每关节预期活动范围
-        desired = self._default_leg_joint_pos + self._joint_ranges * delayed_actions
+        delayed_leg = delayed_actions[:, self._leg_action_slice]
+        desired = self._default_leg_joint_pos + self._joint_ranges * delayed_leg
         # 围绕实测关节角限幅（δ = τmax/kP，保证最大力矩可达，防 setpoint 飞出）
         q_meas = self.robot.data.joint_pos.torch[:, self._leg_dof_idx]
         desired = torch.clamp(desired, q_meas - self._setpoint_max_dev, q_meas + self._setpoint_max_dev)
@@ -335,6 +357,14 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         self._prev_target_joint_pos = self._target_joint_pos
         self._target_joint_pos = desired
         self._processed_actions = desired
+        # 脖子位置目标：后 4 维动作线性映射到默认位 ± range，clamp 到脖子软限位
+        delayed_neck = delayed_actions[:, self._neck_action_slice]
+        neck_target = self._default_neck_joint_pos + self._neck_joint_ranges * delayed_neck
+        self._neck_target = torch.clamp(
+            neck_target,
+            self._soft_neck_joint_pos_limits[:, :, 0],
+            self._soft_neck_joint_pos_limits[:, :, 1],
+        )
         self._substep = 0
         # 相位积分：φ̇ 按命令插值（零命令参考为常量站立帧，相位照走与论文一致）
         phase_rate = self._reference_gait.sample_phase_rate(self._commands)
@@ -380,8 +410,8 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             self.robot.set_joint_effort_target_index(target=tau, joint_ids=self._leg_dof_idx)
         else:
             self.robot.set_joint_effort_target(tau, joint_ids=self._leg_dof_idx)
-        # 脖子固定：高刚度位置驱动锁死默认位
-        self.robot.set_joint_position_target_index(target=self._default_neck_joint_pos, joint_ids=self._neck_dof_idx)
+        # 脖子：位置伺服跟随学习到的目标（头部命令参考角），每子步保持同一目标
+        self.robot.set_joint_position_target_index(target=self._neck_target, joint_ids=self._neck_dof_idx)
 
     def _update_paper_disturbances(self) -> None:
         if not self._disturbances:
@@ -406,6 +436,8 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         ang_vel = self.robot.data.root_ang_vel_b.torch
         joint_pos = self.robot.data.joint_pos.torch[:, self._leg_dof_idx]
         joint_vel = self.robot.data.joint_vel.torch[:, self._leg_dof_idx]
+        neck_joint_pos = self.robot.data.joint_pos.torch[:, self._neck_dof_idx]
+        neck_joint_vel = self.robot.data.joint_vel.torch[:, self._neck_dof_idx]
         # 相位特征（附录 A）：前两阶谐波 sin/cos(k·2πφ), k∈{1,2}
         two_pi_phase = 2.0 * torch.pi * self._phase
         phase_feat = torch.stack(
@@ -434,11 +466,14 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
                     lin_vel_t * self.cfg.lin_vel_scale,
                     ang_vel_t * self.cfg.ang_vel_scale,
                     joint_pos_t * self.cfg.dof_pos_scale,
+                    neck_joint_pos * self.cfg.dof_pos_scale,
                     joint_vel_t * self.cfg.dof_vel_scale,
+                    neck_joint_vel * self.cfg.dof_vel_scale,
                     self._previous_actions,
                     self._prev_prev_actions,
                     phase_feat,
                     self._commands * self._command_scale,
+                    self._head_commands * self._head_command_scale,
                 ),
                 dim=-1,
             )
@@ -505,6 +540,9 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         joint_pos = self.robot.data.joint_pos.torch[:, self._leg_dof_idx]
         joint_vel = self.robot.data.joint_vel.torch[:, self._leg_dof_idx]
         joint_acc = self.robot.data.joint_acc.torch[:, self._leg_dof_idx]
+        neck_joint_pos = self.robot.data.joint_pos.torch[:, self._neck_dof_idx]
+        neck_joint_vel = self.robot.data.joint_vel.torch[:, self._neck_dof_idx]
+        neck_ref = self._neck_head_map.sample(self._head_commands)  # (N,4) 头命令→参考脖子角
         in_contact = (
             self.contact_sensor.data.current_contact_time.torch[:, self._feet_contact_ids] > 0.0
         ).float()
@@ -538,12 +576,28 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         rew_torque = cfg.rew_w_torque * torch.sum(torch.square(self._applied_leg_torque), dim=1)
         rew_joint_acc = cfg.rew_w_joint_acc * torch.sum(torch.square(joint_acc), dim=1)
         rew_action_rate = cfg.rew_w_action_rate * torch.sum(
-            torch.square(self._actions - self._previous_actions), dim=1
+            torch.square(self._actions[:, self._leg_action_slice]
+                         - self._previous_actions[:, self._leg_action_slice]), dim=1
         )
         rew_action_acc = cfg.rew_w_action_acc * torch.sum(
-            torch.square(self._actions - 2.0 * self._previous_actions + self._prev_prev_actions), dim=1
+            torch.square(self._actions[:, self._leg_action_slice]
+                         - 2.0 * self._previous_actions[:, self._leg_action_slice]
+                         + self._prev_prev_actions[:, self._leg_action_slice]), dim=1
         )
-        # 8) 存活
+        # 8) 脖子/头部模仿（论文表 I neck 项）：脖子关节角跟随头命令参考角 + 速度惩罚
+        #    + 脖子动作率/加速度（腿与脖子动作率分开加权，避免脖子快动作被腿的权重误伤）
+        rew_neck_pos = cfg.rew_w_neck_joint_pos * torch.sum(torch.square(neck_joint_pos - neck_ref), dim=1)
+        rew_neck_vel = cfg.rew_w_neck_joint_vel * torch.sum(torch.square(neck_joint_vel), dim=1)
+        rew_neck_action_rate = cfg.rew_w_neck_action_rate * torch.sum(
+            torch.square(self._actions[:, self._neck_action_slice]
+                         - self._previous_actions[:, self._neck_action_slice]), dim=1
+        )
+        rew_neck_action_acc = cfg.rew_w_neck_action_acc * torch.sum(
+            torch.square(self._actions[:, self._neck_action_slice]
+                         - 2.0 * self._previous_actions[:, self._neck_action_slice]
+                         + self._prev_prev_actions[:, self._neck_action_slice]), dim=1
+        )
+        # 9) 存活
         rew_survival = cfg.rew_w_survival * (1.0 - self.reset_terminated.float())
 
         reward_terms = {
@@ -560,6 +614,10 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             "joint_acc": rew_joint_acc,
             "action_rate": rew_action_rate,
             "action_acc": rew_action_acc,
+            "neck_joint_pos": rew_neck_pos,
+            "neck_joint_vel": rew_neck_vel,
+            "neck_action_rate": rew_neck_action_rate,
+            "neck_action_acc": rew_neck_action_acc,
             "survival": rew_survival,
         }
         # 表 I 权重按 legged_gym/Isaac Gym 约定乘 step_dt（论文同一代码谱系）
@@ -593,6 +651,14 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         self._filtered_joint_target[env_ids] = self._default_leg_joint_pos[env_ids]
         self._last_tau_m[env_ids] = 0.0
         self._applied_leg_torque[env_ids] = 0.0
+        # 头部命令：每 env 采样 4-DOF (Δh, pitch, yaw, roll)，整段 episode 恒定
+        self._head_commands[env_ids, 0] = sample_uniform(*self.cfg.head_command_dh_range, (n,), self.device)
+        self._head_commands[env_ids, 1] = sample_uniform(*self.cfg.head_command_pitch_range, (n,), self.device)
+        self._head_commands[env_ids, 2] = sample_uniform(*self.cfg.head_command_yaw_range, (n,), self.device)
+        self._head_commands[env_ids, 3] = sample_uniform(*self.cfg.head_command_roll_range, (n,), self.device)
+        # 脖子位置目标复位到该头命令对应的参考角（避免第一步从默认位跳变）
+        neck_ref_reset = self._neck_head_map.sample(self._head_commands[env_ids])
+        self._neck_target[env_ids] = neck_ref_reset
         # 附录 B 每 episode 随机量：编码器偏移 / 背隙 / PD 增益 / 反射惯量
         self._encoder_offset[env_ids] = (
             torch.rand(n, 10, device=self.device) * 2.0 - 1.0
@@ -621,6 +687,8 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             )
             soft_limits = self.robot.data.soft_joint_pos_limits.torch[rsi_ids][:, self._leg_dof_idx]
             joint_pos[:, self._leg_dof_idx] = torch.clamp(leg_pos, soft_limits[..., 0], soft_limits[..., 1])
+            # 脖子初始角 = 该 env 头命令对应参考角（与位置目标一致，出生即到位不跳变）
+            joint_pos[:, self._neck_dof_idx] = neck_ref_reset[rsi]
             joint_vel = self.robot.data.default_joint_vel.torch[rsi_ids].clone()
             joint_vel[:, self._leg_dof_idx] = ref["joint_vel"]
 

@@ -481,7 +481,10 @@ class OceanisaaclabEnv(DirectRLEnv):
 
         self._actions[env_ids] = 0.0
         self._previous_actions[env_ids] = 0.0
-        self._processed_actions[env_ids] = self._default_leg_joint_pos[env_ids]
+        # 仅前 len(leg) 维是腿位置目标（route A action=腿；route B walk 后 4 维为脖子，
+        # 由子类另行处理）。按腿宽度切片赋值，避免 action_space>10 时形状不匹配。
+        n_leg = self._default_leg_joint_pos.shape[1]
+        self._processed_actions[env_ids, :n_leg] = self._default_leg_joint_pos[env_ids]
         self._action_history[env_ids] = 0.0
         if self.cfg.enable_action_latency:
             self._action_delay[env_ids] = torch.randint(
