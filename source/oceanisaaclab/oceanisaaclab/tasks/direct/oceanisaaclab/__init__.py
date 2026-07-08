@@ -33,6 +33,16 @@ gym.register(
 )
 
 gym.register(
+    id="Ocean-BDX-StandPaper-Direct-v0",
+    entry_point=f"{__name__}.oceanisaaclab_stand_env:OceanisaaclabStandEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.oceanisaaclab_stand_env_cfg:OceanisaaclabStandEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StandPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="Template-Oceanisaaclab-Direct-v0",
     entry_point=f"{__name__}.oceanisaaclab_env:OceanisaaclabEnv",
     disable_env_checker=True,

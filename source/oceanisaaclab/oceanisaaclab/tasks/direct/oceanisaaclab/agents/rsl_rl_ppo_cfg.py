@@ -84,3 +84,29 @@ class WalkPPORunnerCfg(PPORunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class StandPPORunnerCfg(WalkPPORunnerCfg):
+    """路线 B（BDX 论文复刻）站立（perpetual）runner。
+
+    网络/算法沿用 WalkPPORunnerCfg（3×512 ELU + 非对称 critic + obs_groups），维度由环境
+    观测/状态空间自动推断，无需改。仅换日志目录名。站立任务不存在"站着不动=最优"的行走
+    局部最优（本来就要站稳），entropy_coef 调回论文原值 0（不需要额外探索去破盆地）。
+    """
+
+    experiment_name = "bdx_stand_perpetual"
+    algorithm = RslRlPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.0,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=3.0e-4,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )

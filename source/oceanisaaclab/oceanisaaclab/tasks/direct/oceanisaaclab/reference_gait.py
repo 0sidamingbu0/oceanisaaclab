@@ -194,3 +194,43 @@ class NeckHeadMap:
                         out = corner * weight if out is None else out + corner * weight
         return out
 
+
+class StandPose:
+    """站立姿态参考的 torch 采样器（``scripts/gen_stand_pose.py`` 生成）。
+
+    perpetual 站立策略：躯干命令 4-DOF (h_torso 高度偏移, pitch, yaw, roll) → 10 个腿关节
+    参考角。无相位、脚不迈步（双脚固定地面）。头部脖子角由 NeckHeadMap 另行提供（解耦）。
+    四线性插值，纯张量、无循环。
+    """
+
+    def __init__(self, npz_path: str, device: str | torch.device):
+        data = np.load(npz_path, allow_pickle=False)
+        self.device = torch.device(device)
+
+        def tensor(name: str) -> torch.Tensor:
+            return torch.as_tensor(data[name], dtype=torch.float32, device=self.device)
+
+        self.h_grid = tensor("torso_h_grid")
+        self.pitch_grid = tensor("torso_pitch_grid")
+        self.yaw_grid = tensor("torso_yaw_grid")
+        self.roll_grid = tensor("torso_roll_grid")
+        self.joint_pos = tensor("joint_pos")  # (nh, npitch, nyaw, nroll, 10)
+        self.joint_names = [str(n) for n in data["joint_names"]]
+        self.base_height = float(data["base_height"])
+
+    def sample(self, torso_cmd: torch.Tensor) -> torch.Tensor:
+        """按躯干命令 (N,4)=(h_torso, pitch, yaw, roll) 四线性插值返回腿关节角 (N,10)。"""
+        ih0, ih1, wh = ReferenceGait._grid_coords(torso_cmd[:, 0], self.h_grid)
+        ip0, ip1, wp = ReferenceGait._grid_coords(torso_cmd[:, 1], self.pitch_grid)
+        iy0, iy1, wy = ReferenceGait._grid_coords(torso_cmd[:, 2], self.yaw_grid)
+        ir0, ir1, wr = ReferenceGait._grid_coords(torso_cmd[:, 3], self.roll_grid)
+        out = None
+        for ch, fh in ((ih0, 1.0 - wh), (ih1, wh)):
+            for cp, fp in ((ip0, 1.0 - wp), (ip1, wp)):
+                for cy, fy in ((iy0, 1.0 - wy), (iy1, wy)):
+                    for cr, fr in ((ir0, 1.0 - wr), (ir1, wr)):
+                        weight = (fh * fp * fy * fr).unsqueeze(-1)
+                        corner = self.joint_pos[ch, cp, cy, cr]  # (N, 10)
+                        out = corner * weight if out is None else out + corner * weight
+        return out
+

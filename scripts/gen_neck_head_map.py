@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gen_reference_gait import (  # noqa: E402
     DEFAULT_MESH_DIR,
     DEFAULT_URDF,
+    LEG_JOINT_NAMES,
     NECK_JOINT_NAMES,
     REPO_ROOT,
     _rot_y,
@@ -174,6 +175,52 @@ class PlacoNeckIK:
         return q, err
 
 
+def _viz_sweep(ik: "PlacoNeckIK", params: HeadParams, loops: int, hold: float) -> None:
+    """meshcat 里逐轴扫掠头部命令(其余轴归零),实时显示脖子解出的姿态。
+
+    脚保持全零默认站姿,只动脖子 4 关节;每个头命令用 placo 现场求解(与库同一 IK)。
+    依赖 meshcat（pip install meshcat）。打开日志里打印的 URL 观看。
+    """
+    import time
+
+    from placo_utils.visualization import robot_frame_viz, robot_viz
+
+    robot = ik.robot
+    for name in LEG_JOINT_NAMES:
+        robot.set_joint(name, 0.0)
+    viz = robot_viz(robot)
+
+    def show(dh: float, pitch: float, yaw: float, roll: float, label: str) -> None:
+        q, _ = ik.solve(dh, pitch, yaw, roll)
+        for name in LEG_JOINT_NAMES:
+            robot.set_joint(name, 0.0)
+        robot.update_kinematics()
+        viz.display(robot.state.q)
+        robot_frame_viz(robot, HEAD_FRAME)
+        print(f"  [viz] {label:20s} neck[n1..n4]={np.round(q, 3).tolist()}")
+        time.sleep(hold)
+
+    # 每轴：0 → +max → −max → 0，来回扫；其余轴归零
+    axes = [
+        ("dh", params.dh_grid(), 0),
+        ("pitch", params.pitch_grid(), 1),
+        ("yaw", params.yaw_grid(), 2),
+        ("roll", params.roll_grid(), 3),
+    ]
+    print(f"meshcat viz: 逐轴扫掠 {loops} 遍（脚固定默认站姿，只动脖子）")
+    for _ in range(loops):
+        for name, grid, idx in axes:
+            fine = np.concatenate([
+                np.linspace(0.0, grid[-1], 12),
+                np.linspace(grid[-1], grid[0], 24),
+                np.linspace(grid[0], 0.0, 12),
+            ])
+            for v in fine:
+                cmd = [0.0, 0.0, 0.0, 0.0]
+                cmd[idx] = float(v)
+                show(*cmd, f"{name}={v:+.3f}")
+
+
 def generate(params: HeadParams, urdf: Path, mesh_dir: Path) -> dict:
     robot = load_placo_robot(urdf, mesh_dir)
     ik = PlacoNeckIK(robot, params)
@@ -233,6 +280,10 @@ def main() -> None:
     parser.add_argument("--yaw-max", type=float, default=defaults.yaw_max)
     parser.add_argument("--roll-max", type=float, default=defaults.roll_max)
     parser.add_argument("--grid", type=int, default=defaults.grid)
+    parser.add_argument("--viz", action="store_true", help="生成后用 meshcat 逐轴扫掠回放确认头姿")
+    parser.add_argument("--viz-only", action="store_true", help="只可视化、不重新生成/保存 npz")
+    parser.add_argument("--viz-loops", type=int, default=2, help="扫掠遍数")
+    parser.add_argument("--viz-hold", type=float, default=0.03, help="[s] 每帧停留时间")
     args = parser.parse_args()
 
     params = HeadParams(
@@ -243,10 +294,15 @@ def main() -> None:
         grid=args.grid,
     )
     print(params.describe())
-    data = generate(params, args.urdf, args.mesh_dir)
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(args.out, **data)
-    print(f"saved neck-head map → {args.out}  (grid {args.grid}^4 = {args.grid**4} poses)")
+    if not args.viz_only:
+        data = generate(params, args.urdf, args.mesh_dir)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(args.out, **data)
+        print(f"saved neck-head map → {args.out}  (grid {args.grid}^4 = {args.grid**4} poses)")
+    if args.viz or args.viz_only:
+        robot = load_placo_robot(args.urdf, args.mesh_dir)
+        ik = PlacoNeckIK(robot, params)
+        _viz_sweep(ik, params, loops=args.viz_loops, hold=args.viz_hold)
 
 
 if __name__ == "__main__":
