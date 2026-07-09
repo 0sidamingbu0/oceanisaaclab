@@ -5,7 +5,8 @@
 - 头命令 _head_commands 每步清零（复现 sim2sim 无头命令场景）；
 - 关扰动/噪声/延迟，测策略"想做什么"的纯步态意图；
 - 关键量：摆动脚原点离地高度分布 + 对参考步态的 leg 关节追踪残差 Σ(q-q̂)²
-  （= 训练 leg_joint_pos 奖励 /-25，可直接和 tensorboard 对照）。
+  （= 训练 leg_joint_pos 奖励 /-15，可直接和 tensorboard 对照）。
+- path-frame 位置奖励分解：检查原地扭动/摆胯是否仍能吃到 torso_pos_xy 分。
 
 运行：./_isaaclab/isaaclab.sh -p scripts/diag_walk_neck.py --checkpoint <path> --vx 0.15
 """
@@ -77,6 +78,7 @@ feet_c = env._feet_contact_ids
 fwd, base_h, ang_xy = [], [], []
 foot_h_swing, in_contact_frac = [], []
 leg_resid, contact_match = [], []
+pos_pf_hist, ref_pf_hist, pos_err_hist, torso_pos_rew_hist, pf_world_dist_hist = [], [], [], [], []
 warmup = 60
 for t in range(args.steps):
     with torch.inference_mode():
@@ -99,12 +101,20 @@ for t in range(args.steps):
     swing[in_c] = float("nan")
     foot_h_swing.append(swing)
     in_contact_frac.append(in_c.float())
-    # 对参考步态的 leg 关节追踪残差（= 训练 leg_joint_pos 奖励 /-25）
+    # 对参考步态的 leg 关节追踪残差（= 训练 leg_joint_pos 奖励 /-15）
     ref = env._reference_gait.sample(env._commands, env._phase)
     q = env.robot.data.joint_pos.torch[:, env._leg_dof_idx]
     leg_resid.append(((q - ref["joint_pos"]) ** 2).sum(dim=1))
     ref_contact = (ref["feet_contact"] >= 0.5).float()
     contact_match.append((in_c.float() == ref_contact).float().sum(dim=1))
+    base_xy = env.robot.data.root_pos_w.torch[:, :2]
+    pos_pf, _ = env._path_frame.base_in_path_frame(base_xy, env._head_yaw())
+    pos_err = pos_pf - ref["base_pos_pf"]
+    pos_pf_hist.append(pos_pf)
+    ref_pf_hist.append(ref["base_pos_pf"])
+    pos_err_hist.append(pos_err)
+    torso_pos_rew_hist.append(torch.exp(-env.cfg.rew_k_torso_pos_xy * torch.sum(pos_err**2, dim=1)))
+    pf_world_dist_hist.append(torch.norm(env._path_frame.pos - base_xy, dim=1))
 
 FWD = torch.stack(fwd)
 BH = torch.stack(base_h)
@@ -113,6 +123,11 @@ FHS = torch.stack(foot_h_swing)
 IC = torch.stack(in_contact_frac)
 RESID = torch.stack(leg_resid)
 CM = torch.stack(contact_match)
+POS_PF = torch.stack(pos_pf_hist)
+REF_PF = torch.stack(ref_pf_hist)
+POS_ERR = torch.stack(pos_err_hist)
+TORSO_POS_REW = torch.stack(torso_pos_rew_hist)
+PF_WORLD_DIST = torch.stack(pf_world_dist_hist)
 foot_origin_offset = 0.067  # cfg 一致：leg5_link 原点到脚底
 clearance = 0.035  # 参考抬脚高度
 
@@ -124,6 +139,29 @@ print(f"[机身] base height mean={BH.mean():.3f}  roll/pitch 角速度模 p95={
 print(f"\n[追踪残差] leg Σ(q-q̂)² mean={RESID.mean():.4f}  (对应 leg_joint_pos 奖励 = {-15*RESID.mean():.3f})")
 print(f"           每关节 RMS = {(RESID.mean()/10).sqrt():.4f} rad = {(RESID.mean()/10).sqrt()*57.3:.2f} deg")
 print(f"[接触匹配] Σ I[c=ĉ] mean={CM.mean():.3f} (满分 2)")
+print("\n[path-frame xy]")
+print(
+    f"pos_pf mean=({POS_PF[...,0].mean():+.4f}, {POS_PF[...,1].mean():+.4f}) "
+    f"std=({POS_PF[...,0].std():.4f}, {POS_PF[...,1].std():.4f})"
+)
+print(
+    f"ref_pf mean=({REF_PF[...,0].mean():+.4f}, {REF_PF[...,1].mean():+.4f}) "
+    f"std=({REF_PF[...,0].std():.4f}, {REF_PF[...,1].std():.4f})"
+)
+print(
+    f"err x/y mean=({POS_ERR[...,0].mean():+.4f}, {POS_ERR[...,1].mean():+.4f}) "
+    f"rms=({torch.sqrt(torch.mean(POS_ERR[...,0]**2)):.4f}, {torch.sqrt(torch.mean(POS_ERR[...,1]**2)):.4f})"
+)
+print(
+    f"torso_pos_xy instant reward mean={TORSO_POS_REW.mean():.4f} "
+    f"p50={torch.quantile(TORSO_POS_REW.flatten(),0.50):.4f} "
+    f"p95={torch.quantile(TORSO_POS_REW.flatten(),0.95):.4f}"
+)
+print(
+    f"path-frame world distance mean={PF_WORLD_DIST.mean():.4f} "
+    f"p95={torch.quantile(PF_WORLD_DIST.flatten(),0.95):.4f} "
+    f"(clamp {env.cfg.path_frame_max_pos_deviation:.2f}m)"
+)
 print(f"\n[脚高] 支撑相脚原点离地 ≈ {foot_origin_offset:.3f} m；参考摆动峰值应 ≈ {foot_origin_offset+clearance:.3f} m")
 sv = FHS[~torch.isnan(FHS)]
 if sv.numel() > 0:

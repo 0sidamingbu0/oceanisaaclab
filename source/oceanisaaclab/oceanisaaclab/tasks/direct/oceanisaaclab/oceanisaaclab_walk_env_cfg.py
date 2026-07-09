@@ -213,6 +213,11 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     rew_w_leg_joint_vel = -1.0e-3
     # 07-08 回归论文表I原值 1.0（历史加大到 1.5 垫低站立盆地，论文路线回退）。
     rew_w_contact_match = 1.0  # Σᵢ I[cᵢ = ĉᵢ]，每脚一致 +1
+    # 07-09 stage0 仍卡在双脚贴地：contact_match 只给匹配奖励，不惩罚"参考摆动但实际仍接触"。
+    # 仅 bootstrap 前 72k common steps 加一个破局项，迫使策略体验单脚支撑；之后自动回到论文 reward。
+    enable_bootstrap_swing_contact_penalty = True
+    bootstrap_swing_contact_penalty_until_step = 72_000
+    rew_w_bootstrap_swing_contact = -2.0  # -Σᵢ I[ĉᵢ=swing 且 cᵢ=contact]
     rew_w_torque = -1.0e-3
     rew_w_joint_acc = -2.5e-6
     rew_w_action_rate = -1.5  # 腿动作率（论文表 I：leg action rate 1.5）

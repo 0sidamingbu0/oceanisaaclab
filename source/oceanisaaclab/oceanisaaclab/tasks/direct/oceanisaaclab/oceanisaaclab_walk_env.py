@@ -250,6 +250,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
                 "leg_joint_pos",
                 "leg_joint_vel",
                 "contact_match",
+                "bootstrap_swing_contact",
                 "torque",
                 "joint_acc",
                 "action_rate",
@@ -630,6 +631,14 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         # 6) 接触匹配：Σᵢ I[cᵢ = ĉᵢ]
         ref_contact = (ref["feet_contact"] >= 0.5).float()
         rew_contact = cfg.rew_w_contact_match * torch.sum((in_contact == ref_contact).float(), dim=1)
+        swing_contact_violation = torch.sum((1.0 - ref_contact) * in_contact, dim=1)
+        if (
+            cfg.enable_bootstrap_swing_contact_penalty
+            and self.common_step_counter < cfg.bootstrap_swing_contact_penalty_until_step
+        ):
+            rew_bootstrap_swing_contact = cfg.rew_w_bootstrap_swing_contact * swing_contact_violation
+        else:
+            rew_bootstrap_swing_contact = torch.zeros_like(rew_contact)
         # 7) 正则：力矩 / 关节加速度 / 动作率 / 动作加速度
         rew_torque = cfg.rew_w_torque * torch.sum(torch.square(self._applied_leg_torque), dim=1)
         rew_joint_acc = cfg.rew_w_joint_acc * torch.sum(torch.square(joint_acc), dim=1)
@@ -668,6 +677,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             "leg_joint_pos": rew_joint_pos,
             "leg_joint_vel": rew_joint_vel,
             "contact_match": rew_contact,
+            "bootstrap_swing_contact": rew_bootstrap_swing_contact,
             "torque": rew_torque,
             "joint_acc": rew_joint_acc,
             "action_rate": rew_action_rate,
