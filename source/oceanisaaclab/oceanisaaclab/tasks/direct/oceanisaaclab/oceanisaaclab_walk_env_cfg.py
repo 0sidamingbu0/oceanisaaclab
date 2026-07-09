@@ -113,12 +113,11 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     # 奖励（论文表 I 腿部子集；neck 项删除）。权重按 legged_gym 约定乘 step_dt(0.02)。
     # ------------------------------------------------------------------
     rew_w_torso_pos_xy = 1.0  # exp(-k·‖p_pf - p̂_pf‖²)
-    # 论文原值 200，但核太陡（位置差 0.09m 即 exp≈0.2）→ path 位置跟踪梯度稀疏，
-    # 策略够不着迈步信号、退回站立局部最优。放平到 60（0.15m 偏差仍有 ≈0.26 梯度）。
-    # 07-07 复盘（5800 iter 仍站立蹭走）：k=60 时 anchor 跑到 0.25m 钳位处 exp≈0.024≈0，
-    # 动的 env（约 64%）拿不到前进梯度、只有站立 env 在拿分。再放平到 30
-    # （0.25m 处仍有 exp≈0.15 实梯度），给前进 env 追 anchor 的理由。
-    rew_k_torso_pos_xy = 30.0
+    # 07-08 回归论文表I原值 200（强前进模仿，核心）。历史：无脖子阶段曾放平到 30 破站立盆地
+    # （k=200 时 anchor 到 0.25m 钳位处 exp≈0，前进梯度稀疏，见 memory ocean-walk-phase-0701-diverged）。
+    # 但加脖子后 neck=100 + head 扰动压垮弱信号 k=30 → 退回站立（memory ocean-neck-walk-gait-regression）；
+    # 论文靠 k=200 强模仿信号才扛得住 neck=100。配 rsi=0.8 缓解初期梯度稀疏，重训验证。
+    rew_k_torso_pos_xy = 200.0
     rew_w_torso_orient = 1.0  # exp(-20·‖θ ⊟ θ̂‖²)
     rew_k_torso_orient = 20.0
     rew_w_lin_vel_xy = 1.0  # exp(-8·‖v_xy - v̂_xy‖²)
@@ -127,15 +126,12 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     rew_w_ang_vel_xy = 0.5  # exp(-2·‖ω_xy - ω̂_xy‖²)
     rew_k_ang_vel = 2.0
     rew_w_ang_vel_z = 0.5
-    # 07-07 第二轮：改动 1(k30/survival2/entropy0.005)训到 7000 iter 探索保住了
-    # （mean_std 稳在 0.044 未崩），但站立盆地仍未破：torso_pos_xy 平在 0.51、
-    # contact_match 死平 1.20（双脚常着地）、leg_joint_pos 一度升到 -0.55 又回落。
-    # 站着能拿的正分仍压过迈步的摔倒风险。加大此项到 -25，直接逼出摆腿轨迹。
-    rew_w_leg_joint_pos = -25.0  # -‖q - q̂‖²（负 L2，非 exp 核）
+    # 07-08 回归论文表I原值 -15（历史为破站立盆地加大到 -25 逼摆腿；论文路线靠强 torso 位置
+    # 模仿而非加大 leg 逼迈步，回退到论文值）。
+    rew_w_leg_joint_pos = -15.0  # -‖q - q̂‖²（负 L2，非 exp 核）
     rew_w_leg_joint_vel = -1.0e-3
-    # 07-07 第二轮：双脚常着地白拿 1.20（满分 2）。加大到 1.5，让"不迈步的接触模式"
-    # 相对收益下降，配合 leg_joint_pos 一起把站立盆地垫低。
-    rew_w_contact_match = 1.5  # Σᵢ I[cᵢ = ĉᵢ]，每脚一致 +1
+    # 07-08 回归论文表I原值 1.0（历史加大到 1.5 垫低站立盆地，论文路线回退）。
+    rew_w_contact_match = 1.0  # Σᵢ I[cᵢ = ĉᵢ]，每脚一致 +1
     rew_w_torque = -1.0e-3
     rew_w_joint_acc = -2.5e-6
     rew_w_action_rate = -1.5  # 腿动作率（论文表 I：leg action rate 1.5）
@@ -147,12 +143,10 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     rew_w_neck_joint_vel = -1.0  # -‖q̇_neck‖²（论文 neck joint velocities 1.0；参考头姿静止）
     rew_w_neck_action_rate = -5.0  # 论文 neck action rate 5.0
     rew_w_neck_action_acc = -5.0  # 论文 neck action acc 5.0
-    # 论文原值 20，依赖强密集模仿信号才不吞掉任务梯度；本工程信号稀疏时它占了总回报
-    # 约 93%（3000 iter 实测），策略只需"别摔"就锁定回报、退回站立局部最优。降到 5
-    # 仍抑制"主动摔"，但不再压倒 path 位置/朝向跟踪。见 memory ocean-walk-standing-local-optimum。
-    # 07-07 复盘：降到 5 后 survival 仍是前进项 torso_pos_xy 的约 11 倍、依旧主导，
-    # 再降到 2 继续削站立盆地。
-    rew_w_survival = 2.0
+    # 07-08 回归论文表I原值 20。历史降到 2 是因为 k=30 弱模仿信号下 survival 主导总回报、
+    # 逼出站立盆地；现在 torso_pos_xy 回 k=200 强信号，论文范式里 survival=20 与强模仿共存
+    # （前进是精确模仿副产物，不靠低 survival 逼迈步）。见 memory ocean-walk-standing-local-optimum。
+    rew_w_survival = 20.0
 
     # ------------------------------------------------------------------
     # 终止（论文 V-B：躯干/头触地才终止；此处用等效的高度+倾角判定，无需额外接触传感）
