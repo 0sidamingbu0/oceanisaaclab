@@ -79,49 +79,47 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     head_command_curriculum_steps = 120_000
 
     # ------------------------------------------------------------------
-    # 行走 bootstrap 课程（不改论文表 I reward，只改训练分布）
+    # 行走 bootstrap 课程（不改论文表 I reward，只调训练分布/扰动难度）
     # ------------------------------------------------------------------
     # 07-09 诊断 model_8400: vx=0.15 时真实前进≈0、每脚接触比例=1.0、摆动脚样本=0，
-    # 即策略卡在"双脚贴地 + 原地扭"局部最优。论文 reward 保持不动，先用课程让策略学会
-    # phase -> 单脚支撑 -> 抬脚前进，再逐步恢复完整命令/头部/扰动分布。
+    # 即策略卡在"双脚贴地 + 原地扭"局部最优。07-09 后续验证：-6/144k 的 bootstrap
+    # swing-contact 惩罚已能在约 200 iter 破除不抬腿。因此命令分布从 step0 即恢复完整
+    # 方向/静止采样，避免先只学前进导致后续不会静止/转向；仅头命令和扰动仍渐进打开。
     enable_walk_bootstrap_curriculum = True
     # 阶段边界 common_step；1 iter = num_steps_per_env(24) common steps：
     # 3000 / 6000 / 10000 / 15000 / 22000 iter。
     walk_curriculum_stage_steps = (72_000, 144_000, 240_000, 360_000, 528_000)
     # 每阶段配置含义：
-    #   0 bootstrap: 只训小范围前进, 无站立/后退/转向/侧向/头/扰动, RSI=1.0
-    #   1 前后走:   恢复少量站立与后退
-    #   2 yaw:      恢复原地/行进转向
-    #   3 vy:       恢复侧向命令
-    #   4 head:     恢复半幅头部命令
-    #   5 full:     完整当前任务分布 + paper disturbance 课程
+    #   0~3: 完整行走命令分布 + 无头命令/无扰动，bootstrap 惩罚在 144k 前生效
+    #   4:   完整行走命令分布 + 半幅头命令
+    #   5:   完整行走命令分布 + 满幅头命令 + paper disturbance 课程
     walk_curriculum_vx_ranges = (
-        (0.12, 0.18),
-        (0.08, 0.25),
+        (0.0, 0.25),
+        (0.0, 0.25),
         (0.0, 0.25),
         (0.0, 0.25),
         (0.0, 0.25),
         (0.0, 0.25),
     )
     walk_curriculum_vy_ranges = (
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (-0.08, 0.08),
+        (-0.15, 0.15),
+        (-0.15, 0.15),
+        (-0.15, 0.15),
+        (-0.15, 0.15),
         (-0.15, 0.15),
         (-0.15, 0.15),
     )
     walk_curriculum_wz_ranges = (
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (-0.4, 0.4),
-        (-0.6, 0.6),
+        (-0.8, 0.8),
+        (-0.8, 0.8),
+        (-0.8, 0.8),
+        (-0.8, 0.8),
         (-0.8, 0.8),
         (-0.8, 0.8),
     )
-    walk_curriculum_backward_probs = (0.0, 0.3, 0.5, 0.5, 0.5, 0.5)
-    walk_curriculum_stand_probs = (0.0, 0.05, 0.10, 0.12, 0.15, 0.15)
-    walk_curriculum_turn_probs = (0.0, 0.0, 0.10, 0.18, 0.25, 0.25)
+    walk_curriculum_backward_probs = (0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
+    walk_curriculum_stand_probs = (0.15, 0.15, 0.15, 0.15, 0.15, 0.15)
+    walk_curriculum_turn_probs = (0.25, 0.25, 0.25, 0.25, 0.25, 0.25)
     walk_curriculum_rsi_probs = (1.0, 0.9, 0.85, 0.8, 0.8, 0.8)
     walk_curriculum_rsi_joint_pos_noise = (0.01, 0.015, 0.02, 0.03, 0.03, 0.03)
     walk_curriculum_head_dh_ranges = (

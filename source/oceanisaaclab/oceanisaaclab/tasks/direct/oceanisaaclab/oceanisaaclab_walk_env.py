@@ -476,6 +476,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         moving_or_turning = ~standing
         vy = self._sample_range(self.cfg.walk_curriculum_vy_ranges[stage], (n,))
         vy[torch.abs(vy) < self.cfg.move_command_threshold] = 0.0
+        vy[turn_in_place] = 0.0
         wz = self._sample_range(self.cfg.walk_curriculum_wz_ranges[stage], (n,))
 
         self._commands[env_ids, 0] = vx
