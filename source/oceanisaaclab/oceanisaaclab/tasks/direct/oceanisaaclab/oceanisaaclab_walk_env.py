@@ -416,7 +416,12 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
     def _update_paper_disturbances(self) -> None:
         if not self._disturbances:
             return
-        scale = min(1.0, self.common_step_counter / float(self.cfg.disturbance_curriculum_steps))
+        if self.cfg.enable_walk_bootstrap_curriculum:
+            start = self.cfg.walk_curriculum_disturbance_start_step
+            scale = (self.common_step_counter - start) / float(self.cfg.disturbance_curriculum_steps)
+            scale = max(0.0, min(1.0, scale))
+        else:
+            scale = min(1.0, self.common_step_counter / float(self.cfg.disturbance_curriculum_steps))
         for sched in self._disturbances:
             sched.step(self.step_dt, scale)
         forces = torch.cat([s.forces for s in self._disturbances], dim=1)
@@ -424,6 +429,59 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         self.robot.permanent_wrench_composer.set_forces_and_torques(
             forces, torques, body_ids=self._dist_body_ids, is_global=True
         )
+
+    def _walk_curriculum_stage(self) -> int:
+        if not self.cfg.enable_walk_bootstrap_curriculum:
+            return len(self.cfg.walk_curriculum_stage_steps)
+        stage = 0
+        for boundary in self.cfg.walk_curriculum_stage_steps:
+            if self.common_step_counter < boundary:
+                return stage
+            stage += 1
+        return stage
+
+    def _sample_range(self, value_range: tuple[float, float], shape: tuple[int, ...]) -> torch.Tensor:
+        lo, hi = value_range
+        if abs(hi - lo) < 1e-12:
+            return torch.full(shape, lo, dtype=torch.float, device=self.device)
+        return sample_uniform(lo, hi, shape, self.device)
+
+    def _sample_walk_curriculum_commands(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Override base command sampling with the bootstrap curriculum for walk imitation."""
+        n = len(env_ids)
+        stage = self._walk_curriculum_stage()
+        self._commands[env_ids] = 0.0
+
+        vx = self._sample_range(self.cfg.walk_curriculum_vx_ranges[stage], (n,))
+        small_vx = torch.abs(vx) < self.cfg.move_command_threshold
+        vx[small_vx] = 0.0
+
+        non_standing = torch.ones(n, dtype=torch.bool, device=self.device)
+        standing = torch.rand(n, device=self.device) < self.cfg.walk_curriculum_stand_probs[stage]
+        vx[standing] = 0.0
+        non_standing[standing] = False
+
+        turn_in_place = (
+            torch.rand(n, device=self.device) < self.cfg.walk_curriculum_turn_probs[stage]
+        ) & non_standing
+        vx[turn_in_place] = 0.0
+
+        moving = non_standing & ~turn_in_place
+        backward = (
+            torch.rand(n, device=self.device) < self.cfg.walk_curriculum_backward_probs[stage]
+        ) & moving
+        vx[backward] *= -1.0
+
+        moving_or_turning = ~standing
+        vy = self._sample_range(self.cfg.walk_curriculum_vy_ranges[stage], (n,))
+        vy[torch.abs(vy) < self.cfg.move_command_threshold] = 0.0
+        wz = self._sample_range(self.cfg.walk_curriculum_wz_ranges[stage], (n,))
+
+        self._commands[env_ids, 0] = vx
+        self._commands[env_ids[moving_or_turning], 1] = vy[moving_or_turning]
+        self._commands[env_ids[moving_or_turning], 2] = wz[moving_or_turning]
+        self._is_standing[env_ids] = standing
+        return standing
 
     # ------------------------------------------------------------------
     # observations: paper eq. (8) + phase harmonics + command; asymmetric critic
@@ -642,6 +700,13 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             return  # __init__ 里父类构造期间的首次全量 reset：本类缓冲尚未建立
 
         n = len(env_ids)
+        if self.cfg.enable_walk_bootstrap_curriculum:
+            self._sample_walk_curriculum_commands(env_ids)
+            # Base reset may have seeded root velocity from its generic command sampler.
+            # The walk curriculum owns commands, so clear that seed; RSI below will
+            # overwrite root velocity with the reference velocity for sampled envs.
+            root_vel = self.robot.data.default_root_vel.torch[env_ids].clone()
+            self.robot.write_root_velocity_to_sim_index(root_velocity=root_vel, env_ids=env_ids)
         # 相位随机偏置
         self._phase[env_ids] = torch.rand(n, device=self.device)
         # 动作管线缓冲复位
@@ -652,14 +717,35 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         self._last_tau_m[env_ids] = 0.0
         self._applied_leg_torque[env_ids] = 0.0
         # 头部命令：每 env 采样 4-DOF (Δh, pitch, yaw, roll)，整段 episode 恒定。
-        # 课程：采样范围按 common_step_counter 从 0 线性放开到满范围（见 cfg
-        # head_command_curriculum_steps）。范围对称于 0，乘 hscale 即绕 0 收缩，
-        # hscale=0 时头命令全 0（脖子停在默认位）→ 腿步态先在无头部扰动下长熟。
-        hscale = min(1.0, self.common_step_counter / float(self.cfg.head_command_curriculum_steps))
-        self._head_commands[env_ids, 0] = hscale * sample_uniform(*self.cfg.head_command_dh_range, (n,), self.device)
-        self._head_commands[env_ids, 1] = hscale * sample_uniform(*self.cfg.head_command_pitch_range, (n,), self.device)
-        self._head_commands[env_ids, 2] = hscale * sample_uniform(*self.cfg.head_command_yaw_range, (n,), self.device)
-        self._head_commands[env_ids, 3] = hscale * sample_uniform(*self.cfg.head_command_roll_range, (n,), self.device)
+        if self.cfg.enable_walk_bootstrap_curriculum:
+            stage = self._walk_curriculum_stage()
+            self._head_commands[env_ids, 0] = self._sample_range(
+                self.cfg.walk_curriculum_head_dh_ranges[stage], (n,)
+            )
+            self._head_commands[env_ids, 1] = self._sample_range(
+                self.cfg.walk_curriculum_head_pitch_ranges[stage], (n,)
+            )
+            self._head_commands[env_ids, 2] = self._sample_range(
+                self.cfg.walk_curriculum_head_yaw_ranges[stage], (n,)
+            )
+            self._head_commands[env_ids, 3] = self._sample_range(
+                self.cfg.walk_curriculum_head_roll_ranges[stage], (n,)
+            )
+        else:
+            # Legacy head-command curriculum: scale the full configured ranges from 0 to 1.
+            hscale = min(1.0, self.common_step_counter / float(self.cfg.head_command_curriculum_steps))
+            self._head_commands[env_ids, 0] = hscale * sample_uniform(
+                *self.cfg.head_command_dh_range, (n,), self.device
+            )
+            self._head_commands[env_ids, 1] = hscale * sample_uniform(
+                *self.cfg.head_command_pitch_range, (n,), self.device
+            )
+            self._head_commands[env_ids, 2] = hscale * sample_uniform(
+                *self.cfg.head_command_yaw_range, (n,), self.device
+            )
+            self._head_commands[env_ids, 3] = hscale * sample_uniform(
+                *self.cfg.head_command_roll_range, (n,), self.device
+            )
         # 脖子位置目标复位到该头命令对应的参考角（避免第一步从默认位跳变）
         neck_ref_reset = self._neck_head_map.sample(self._head_commands[env_ids])
         self._neck_target[env_ids] = neck_ref_reset
@@ -680,14 +766,20 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
 
         # ---- RSI：部分 env 从随机相位参考帧出发 ----
         pf_offset = None
-        rsi = torch.rand(n, device=self.device) < self.cfg.rsi_prob
+        if self.cfg.enable_walk_bootstrap_curriculum:
+            rsi_prob = self.cfg.walk_curriculum_rsi_probs[self._walk_curriculum_stage()]
+            rsi_joint_pos_noise = self.cfg.walk_curriculum_rsi_joint_pos_noise[self._walk_curriculum_stage()]
+        else:
+            rsi_prob = self.cfg.rsi_prob
+            rsi_joint_pos_noise = self.cfg.rsi_joint_pos_noise
+        rsi = torch.rand(n, device=self.device) < rsi_prob
         if torch.any(rsi):
             rsi_ids = env_ids[rsi]
             ref = self._reference_gait.sample(self._commands[rsi_ids], self._phase[rsi_ids])
 
             joint_pos = self.robot.data.default_joint_pos.torch[rsi_ids].clone()
             leg_pos = ref["joint_pos"] + torch.empty_like(ref["joint_pos"]).uniform_(
-                -self.cfg.rsi_joint_pos_noise, self.cfg.rsi_joint_pos_noise
+                -rsi_joint_pos_noise, rsi_joint_pos_noise
             )
             soft_limits = self.robot.data.soft_joint_pos_limits.torch[rsi_ids][:, self._leg_dof_idx]
             joint_pos[:, self._leg_dof_idx] = torch.clamp(leg_pos, soft_limits[..., 0], soft_limits[..., 1])
@@ -718,3 +810,6 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             pf_offset = torch.zeros(n, 2, device=self.device)
             pf_offset[rsi] = ref["base_pos_pf"]
         self._reset_path_frame(env_ids, pf_offset)
+        if self.cfg.enable_walk_bootstrap_curriculum:
+            self.extras.setdefault("log", {})
+            self.extras["log"]["Curriculum/walk_stage"] = float(self._walk_curriculum_stage())
