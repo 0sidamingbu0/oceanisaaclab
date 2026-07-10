@@ -81,14 +81,14 @@ class GaitParams:
     gait_period: float = 0.6
     """[s] 完整步态周期（左右脚各迈一步）。必须与 env cfg.gait_cycle_period 一致。"""
 
-    gait_period_fast: float = -1.0
+    gait_period_fast: float = 0.48
     """[s] 满速命令下的步态周期（BDX 论文：相位速率 φ̇ 随命令变化，走得快步频高）。
     <=0 表示与 gait_period 相同（恒定步频）。每个命令的周期按速度占比在
     gait_period（零速）与 gait_period_fast（满速）之间线性插值，库里存 phase_rate
     (=1/周期) 表，训练环境按命令插值积分相位。"""
 
-    gait_duty: float = 0.5
-    """单脚支撑相占空比（0.5 = 支撑/摆动各半，无双支撑）。与 cfg.gait_duty_factor 一致。"""
+    gait_duty: float = 0.6
+    """单脚接触占空比。0.6 在左右反相步态中产生每周期 20% 的双支撑窗口。"""
 
     num_phase_samples: int = 48
     """每周期相位采样帧数（48 帧 @0.6s ≈ 80Hz）。"""
@@ -333,20 +333,44 @@ def generate_command_gait(
     if standing:
         joint_vel[:] = 0.0
     # base 参考量（body 系）：v_body = Ry(lean) @ (v_base, 0)；proj_g = Ry(lean) @ (0,0,-1)
-    lin_vel_b = rot_lean @ np.array([v_base[0], v_base[1], 0.0])
+    phases = np.arange(n_phase) / n_phase
+    sway_rate_pf = np.zeros(n_phase) if standing else (
+        FORWARD_VX_SIGN * params.lateral_sway * 2.0 * np.pi / cmd_period
+        * np.cos(2.0 * np.pi * phases)
+    )
+    lin_vel_b = np.zeros((n_phase, 3))
+    for k in range(n_phase):
+        # base_pos_pf is expressed in head/path coordinates; convert its derivative
+        # to the URDF base frame before applying the constant torso lean.
+        v_with_sway = v_base + np.array([0.0, FORWARD_VX_SIGN * sway_rate_pf[k]])
+        lin_vel_b[k] = rot_lean @ np.array([v_with_sway[0], v_with_sway[1], 0.0])
     proj_g = rot_lean @ np.array([0.0, 0.0, -1.0])
     # body 系角速度：稳态转向时 ω_world=(0,0,wz)，ω_b = R_bw @ ω_w = rot_lean @ (0,0,wz)
-    ang_vel_b = rot_lean @ np.array([0.0, 0.0, wz])
+    ang_vel_b = np.repeat(
+        (rot_lean @ np.array([0.0, 0.0, wz]))[None, :], n_phase, axis=0
+    )
     # path 系躯干 xy 轨迹（BDX 论文公式 (1) 的 p_t，path frame 坐标，+x=头前向）：
     # 生成器把脚目标在 base 系 y 方向平移 -sway(φ) ⇒ 躯干相对双脚中心（=path frame）
     # 在 base 系 +y 偏移 +sway(φ)。head-left 轴 = FORWARD_VX_SIGN * base_y = -base_y，
     # 故 path 系 y = -sway(φ) = +lateral_sway*sin(2πφ) 取负。x 方向本步态无前后振荡 → 0。
     base_pos_pf = np.zeros((n_phase, 2))
     if not standing:
-        phases = np.arange(n_phase) / n_phase
         base_pos_pf[:, 1] = FORWARD_VX_SIGN * params.lateral_sway * np.sin(2.0 * np.pi * phases)
     # path 系躯干偏航（相对 path frame 朝向的 yaw 振荡）：本步态不建模 → 0
     base_yaw_pf = np.zeros(n_phase)
+    # Nominal expressive head motion from the periodic reference. User head
+    # commands are added as offsets at runtime, matching paper Eq. (6).
+    neck_pos = np.zeros((n_phase, 4))
+    if not standing:
+        wave = np.sin(2.0 * np.pi * phases)
+        wave_quadrature = np.cos(2.0 * np.pi * phases)
+        neck_pos[:, 0] = 0.035 * wave_quadrature
+        neck_pos[:, 1] = -0.035 * wave_quadrature
+        neck_pos[:, 2] = 0.045 * wave
+        neck_pos[:, 3] = 0.035 * wave
+    neck_vel = (np.roll(neck_pos, -1, axis=0) - np.roll(neck_pos, 1, axis=0)) / (2.0 * dt)
+    if standing:
+        neck_vel[:] = 0.0
     return {
         "joint_pos": joint_pos,
         "joint_vel": joint_vel,
@@ -359,6 +383,8 @@ def generate_command_gait(
         "base_height": base_height,
         "base_pitch": -lean,  # R_wb = Ry(base_pitch)
         "phase_rate": 1.0 / cmd_period,
+        "neck_pos": neck_pos,
+        "neck_vel": neck_vel,
         "max_pos_err": max_pos_err,
     }
 
@@ -475,8 +501,10 @@ def main() -> None:
     feet_contact = np.zeros((nx, ny, nz, n_phase, 2), dtype=np.float32)
     base_pos_pf = np.zeros((nx, ny, nz, n_phase, 2), dtype=np.float32)
     base_yaw_pf = np.zeros((nx, ny, nz, n_phase), dtype=np.float32)
-    lin_vel_b = np.zeros((nx, ny, nz, 3), dtype=np.float32)
-    ang_vel_b = np.zeros((nx, ny, nz, 3), dtype=np.float32)
+    lin_vel_b = np.zeros((nx, ny, nz, n_phase, 3), dtype=np.float32)
+    ang_vel_b = np.zeros_like(lin_vel_b)
+    neck_pos = np.zeros((nx, ny, nz, n_phase, 4), dtype=np.float32)
+    neck_vel = np.zeros_like(neck_pos)
     proj_g = np.zeros((nx, ny, nz, 3), dtype=np.float32)
     base_height_tab = np.zeros((nx, ny, nz), dtype=np.float32)
     base_pitch = np.zeros((nx, ny, nz), dtype=np.float32)
@@ -500,6 +528,8 @@ def main() -> None:
                 base_height_tab[ix, iy, iz] = frames["base_height"]
                 base_pitch[ix, iy, iz] = frames["base_pitch"]
                 phase_rate[ix, iy, iz] = frames["phase_rate"]
+                neck_pos[ix, iy, iz] = frames["neck_pos"]
+                neck_vel[ix, iy, iz] = frames["neck_vel"]
                 worst_err = max(worst_err, frames["max_pos_err"])
                 step_len = abs(vx) * params.gait_period * params.gait_duty
                 print(
@@ -528,6 +558,8 @@ def main() -> None:
         base_height=base_height_tab,
         base_pitch=base_pitch,
         phase_rate=phase_rate,
+        neck_pos=neck_pos,
+        neck_vel=neck_vel,
         vx_grid=vx_grid.astype(np.float32),
         vy_grid=vy_grid.astype(np.float32),
         wz_grid=wz_grid.astype(np.float32),

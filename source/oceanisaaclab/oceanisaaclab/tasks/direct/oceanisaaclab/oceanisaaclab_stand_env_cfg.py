@@ -10,7 +10,7 @@
 θ_torso)（式 5）——躯干高度/朝向 + 头部高度/朝向。观测去掉行走策略的相位二阶谐波，
 命令由行走的 (cmd3 + head4) 换成 (torso4 + head4)。
 
-- 继承 OceanisaaclabWalkEnvCfg：复用附录 B 执行器模型、表 V 扰动、域随机化、torso 触地
+- 继承 OceanisaaclabWalkEnvCfg：复用附录 B 执行器模型、表 V 扰动、域随机化、torso 等效触地
   终止、非对称 critic、path frame、脖子位置伺服、脖子/头部命令映射。
 - 观测 74 维（去 phase 谐波4；命令 torso4+head4=8）：
   p_pf2 + yaw_pf2 + lin_vel3 + ang_vel3 + q_leg10 + q_neck4 + qd_leg10 + qd_neck4

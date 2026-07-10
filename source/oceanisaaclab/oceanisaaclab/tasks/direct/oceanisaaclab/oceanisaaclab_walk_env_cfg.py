@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""路线 B（BDX 论文完整复刻）训练环境配置。
+"""路线 B（BDX 论文适配复刻）训练环境配置。
 
 对照迪士尼论文《Design and Control of a Bipedal Robotic Character》(RSS 2024,
 工程根目录 BD_X_paper.pdf) 的 periodic walking policy 复刻，固定脖子、只训 10 个
@@ -22,10 +22,37 @@
   线性课程。
 """
 
+import isaaclab.sim as sim_utils
+import isaaclab.terrains as terrain_gen
 from isaaclab.sim import SimulationCfg
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 from isaaclab.utils.configclass import configclass
+from isaaclab_physx.physics import PhysxCfg
 
 from .oceanisaaclab_env_cfg import OCEAN_ASSET_DIR, OceanisaaclabEnvCfg
+
+
+WALK_TERRAINS_CFG = TerrainGeneratorCfg(
+    size=(4.0, 4.0),
+    border_width=10.0,
+    num_rows=8,
+    num_cols=16,
+    curriculum=False,
+    horizontal_scale=0.05,
+    vertical_scale=0.0025,
+    slope_threshold=0.75,
+    sub_terrains={
+        "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.5),
+        "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+            proportion=0.5,
+            noise_range=(-0.012, 0.012),
+            noise_step=0.004,
+            border_width=0.25,
+        ),
+    },
+)
 
 
 @configclass
@@ -36,18 +63,51 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     # 控制频率链（论文 V-D）：策略 50Hz，低层 200Hz（论文真机 600Hz，仿真取 4 倍抽取）
     # ------------------------------------------------------------------
     decimation = 4
-    sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=4)
+    sim: SimulationCfg = SimulationCfg(
+        dt=1 / 200,
+        render_interval=4,
+        # Flat pre-training has far fewer contact patches than rough-terrain training.
+        # These capacities leave headroom for early-policy falls at 8192 environments.
+        physics=PhysxCfg(
+            gpu_max_rigid_contact_count=2**24,
+            gpu_max_rigid_patch_count=2**20,
+        ),
+    )
+
+    # Restore the paper's parallel rollout shape for the inexpensive flat pre-training stage.
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=8192, env_spacing=2.0, replicate_physics=True
+    )
 
     # ------------------------------------------------------------------
     # 空间维度（改布局旧 checkpoint 全部作废）
     # ------------------------------------------------------------------
     # 14 = 10 腿 + 4 脖子（脖子改为学习控制的位置目标，不再锁死）
     action_space = 14
-    # 77 维：p_pf2 + yaw_pf(sin,cos)2 + lin_vel_b3 + ang_vel_b3 + q_leg10 + q_neck4
+    # 80 维：p_pf2 + yaw_pf(sin,cos)2 + projected_gravity3 + lin_vel_b3 + ang_vel_b3 + q_leg10 + q_neck4
     #        + qd_leg10 + qd_neck4 + a_{t-1}14 + a_{t-2}14 + phase谐波4 + cmd3 + head_cmd4
-    observation_space = 77
-    # 非对称 critic：无噪声 77 维 + 摩擦系数缩放 1 + 质量缩放 1
-    state_space = 79
+    observation_space = 80
+    # 非对称 critic：无噪声 80 维 + 摩擦系数缩放 1 + 质量缩放 1
+    state_space = 82
+    gait_duty_factor = 0.6
+
+    # Learn the nominal periodic gait on a PhysX plane first. Rough terrain is exposed by
+    # OceanisaaclabWalkRoughEnvCfg after the policy no longer falls on almost every reset.
+    # This keeps the paper's terrain randomization while avoiding all-body mesh contacts
+    # during the expensive initial exploration stage.
+    terrain = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="plane",
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=0.5,
+            dynamic_friction=0.5,
+            restitution=0.0,
+        ),
+        debug_vis=False,
+    )
 
     # ------------------------------------------------------------------
     # 参考步态库（scripts/gen_reference_gait.py 生成；含 path 系躯干轨迹与 φ̇ 表）
@@ -72,90 +132,9 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     head_command_roll_range = (-0.6, 0.6)  # [rad] 歪头
     # 头命令 obs 缩放（dh 量级小，放大到与其它命令可比；obs_normalization 亦会归一）
     head_command_scale = (20.0, 1.0, 1.0, 1.0)
-    # 头命令课程（07-08 复盘：脖子直接满范围进 RL 使前进步态退化——歪头/扭头=base 顶非对称
-    # 质量偏置，早期把对称参考步态带偏，策略退回蹭步、torso_orient/pos/contact 全塌，见 memory
-    # ocean-neck-walk-gait-regression）。头命令采样范围按 common_step_counter 从 0 线性放开到满
-    # 范围，让腿步态先长熟再引入头部扰动。0→满：5000 iter × 24 steps/env = 120_000 common steps。
-    head_command_curriculum_steps = 120_000
-
-    # ------------------------------------------------------------------
-    # 行走 bootstrap 课程（不改论文表 I reward，只调训练分布/扰动难度）
-    # ------------------------------------------------------------------
-    # 07-09 诊断 model_8400: vx=0.15 时真实前进≈0、每脚接触比例=1.0、摆动脚样本=0，
-    # 即策略卡在"双脚贴地 + 原地扭"局部最优。07-09 后续验证：-6/144k 的 bootstrap
-    # swing-contact 惩罚已能在约 200 iter 破除不抬腿。因此命令分布从 step0 即恢复完整
-    # 方向/静止采样，避免先只学前进导致后续不会静止/转向；仅头命令和扰动仍渐进打开。
-    enable_walk_bootstrap_curriculum = True
-    # 阶段边界 common_step；1 iter = num_steps_per_env(24) common steps：
-    # 3000 / 6000 / 10000 / 15000 / 22000 iter。
-    walk_curriculum_stage_steps = (72_000, 144_000, 240_000, 360_000, 528_000)
-    # 每阶段配置含义：
-    #   0~3: 完整行走命令分布 + 无头命令/无扰动，bootstrap 惩罚在 144k 前生效
-    #   4:   完整行走命令分布 + 半幅头命令
-    #   5:   完整行走命令分布 + 满幅头命令 + paper disturbance 课程
-    walk_curriculum_vx_ranges = (
-        (0.0, 0.25),
-        (0.0, 0.25),
-        (0.0, 0.25),
-        (0.0, 0.25),
-        (0.0, 0.25),
-        (0.0, 0.25),
-    )
-    walk_curriculum_vy_ranges = (
-        (-0.15, 0.15),
-        (-0.15, 0.15),
-        (-0.15, 0.15),
-        (-0.15, 0.15),
-        (-0.15, 0.15),
-        (-0.15, 0.15),
-    )
-    walk_curriculum_wz_ranges = (
-        (-0.8, 0.8),
-        (-0.8, 0.8),
-        (-0.8, 0.8),
-        (-0.8, 0.8),
-        (-0.8, 0.8),
-        (-0.8, 0.8),
-    )
-    walk_curriculum_backward_probs = (0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
-    walk_curriculum_stand_probs = (0.15, 0.15, 0.15, 0.15, 0.15, 0.15)
-    walk_curriculum_turn_probs = (0.25, 0.25, 0.25, 0.25, 0.25, 0.25)
-    walk_curriculum_rsi_probs = (1.0, 0.9, 0.85, 0.8, 0.8, 0.8)
-    walk_curriculum_rsi_joint_pos_noise = (0.01, 0.015, 0.02, 0.03, 0.03, 0.03)
-    walk_curriculum_head_dh_ranges = (
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (-0.01, 0.01),
-        (-0.02, 0.02),
-    )
-    walk_curriculum_head_pitch_ranges = (
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (-0.25, 0.25),
-        (-0.5, 0.5),
-    )
-    walk_curriculum_head_yaw_ranges = (
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (-0.5, 0.5),
-        (-1.0, 1.0),
-    )
-    walk_curriculum_head_roll_ranges = (
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (-0.3, 0.3),
-        (-0.6, 0.6),
-    )
-    # paper disturbance 在完整分布阶段才开始，之后按 disturbance_curriculum_steps 线性拉满。
-    walk_curriculum_disturbance_start_step = 528_000
+    # 论文要求控制输入从训练开始就在完整范围随机化。episode 内定期换目标，覆盖部署时
+    # joystick 阶跃与策略切换，而不是只在 8 秒 episode 开头采一次常值。
+    control_resample_interval_s = (1.5, 3.5)
 
     # ------------------------------------------------------------------
     # path frame（论文 V-A / Fig.4）
@@ -211,12 +190,6 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     rew_w_leg_joint_vel = -1.0e-3
     # 07-08 回归论文表I原值 1.0（历史加大到 1.5 垫低站立盆地，论文路线回退）。
     rew_w_contact_match = 1.0  # Σᵢ I[cᵢ = ĉᵢ]，每脚一致 +1
-    # 07-09 stage0 仍卡在双脚贴地：contact_match 只给匹配奖励，不惩罚"参考摆动但实际仍接触"。
-    # 仅 bootstrap 前 144k common steps 加一个破局项，迫使策略体验单脚支撑；之后自动回到论文 reward。
-    # -2/72k 已验证会被策略硬吃，故提升到 -6/144k。
-    enable_bootstrap_swing_contact_penalty = True
-    bootstrap_swing_contact_penalty_until_step = 144_000
-    rew_w_bootstrap_swing_contact = -6.0  # -Σᵢ I[ĉᵢ=swing 且 cᵢ=contact]
     rew_w_torque = -1.0e-3
     rew_w_joint_acc = -2.5e-6
     rew_w_action_rate = -1.5  # 腿动作率（论文表 I：leg action rate 1.5）
@@ -234,18 +207,22 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     rew_w_survival = 20.0
 
     # ------------------------------------------------------------------
-    # 终止（论文 V-B：躯干/头触地才终止；此处用等效的高度+倾角判定，无需额外接触传感）
+    # 终止（论文 V-B）：躯干或头部触地。当前 nested URDF 的 PhysX contact
+    # view 在大规模场景中存在漏报/错误聚合，因此用 base collision 高度与倾角
+    # 做等效判定。base mesh 最低点相对 root 约 -0.185m，0.20m 覆盖 ±12mm roughness。
     # ------------------------------------------------------------------
-    walk_min_base_height = 0.2  # [m] 低于视为躯干触地
-    walk_min_upright_projection = 0.2  # -proj_g_z 低于（倾角 >≈78°）视为倒地
+    walk_min_base_height = 0.20  # [m], root height relative to the terrain origin
+    walk_min_upright_projection = 0.20  # -projected_gravity_z; about 78.5 degrees tilt
 
     # ------------------------------------------------------------------
-    # RSI（论文未用但不冲突、已验证有效）
-    # 07-07 第二轮：从参考迈步中途（且在移动）起步的 env 越多，越能亲身体验
-    # "追上 anchor = 拿高分"、模仿信号越密。论文重度依赖 RSI。0.5→0.8 破站立盆地。
+    # RSI：从参考迈步中途起步，提高周期状态覆盖并避免只探索站立盆地。
     # ------------------------------------------------------------------
     rsi_prob = 0.8
     rsi_joint_pos_noise = 0.03  # [rad]
+    # Sample reflected inertia once per parallel environment. With 8192 environments this
+    # still covers the randomized dynamics distribution, without a PhysX property write on
+    # every high-frequency early-policy reset.
+    randomize_armature_each_reset = False
 
     # ------------------------------------------------------------------
     # 表 V 三档扰动（每 body 独立进程）。力/矩幅值已按整机质量 ≈10kg / 论文 15.4kg
@@ -261,8 +238,8 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     dist_small_short_torque = (0.0, 0.25)  # [Nm]
     dist_small_short_on_s = (0.25, 2.0)
     dist_small_short_off_s = (1.0, 3.0)
-    # 长/小：盆骨（脖子固定，头档并入盆骨）
-    dist_small_long_bodies = ("base_link",)
+    # 长/小：盆骨 + 头部，各 body 独立进程。
+    dist_small_long_bodies = ("base_link", "neck_n4_link")
     dist_small_long_force_xy = (0.0, 5.0)
     dist_small_long_force_z = (0.0, 5.0)
     dist_small_long_torque = (0.0, 0.25)
@@ -307,3 +284,44 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
         neck = self.robot_cfg.actuators["neck"]
         neck.stiffness = 50.0
         neck.damping = 2.0
+        # 只为两只脚手动添加 contact-report API；避免 URDF importer 默认给 base
+        # 添加不再需要的 report，也不创建不可靠的 torso/head nested views。
+        self.robot_cfg.spawn.activate_contact_sensors = False
+        # 当前 URDF 的凸包在名义姿态存在内部重叠；启用全局 self-collision 会让头部
+        # 持续承受约 3.4 kN 的伪接触力。保留关节限位并使用高度/倾角终止。
+        self.robot_cfg.spawn.self_collision = False
+        self.robot_cfg.spawn.articulation_props.enabled_self_collisions = False
+
+
+@configclass
+class OceanisaaclabWalkRoughEnvCfg(OceanisaaclabWalkEnvCfg):
+    """Rough-terrain fine-tuning after the flat walking policy is stable."""
+
+    sim: SimulationCfg = SimulationCfg(
+        dt=1 / 200,
+        render_interval=4,
+        physics=PhysxCfg(
+            gpu_max_rigid_contact_count=2**24,
+            gpu_max_rigid_patch_count=2**22,
+        ),
+    )
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=2048, env_spacing=2.0, replicate_physics=True
+    )
+    terrain = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="generator",
+        terrain_generator=WALK_TERRAINS_CFG,
+        max_init_terrain_level=None,
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=0.5,
+            dynamic_friction=0.5,
+            restitution=0.0,
+        ),
+        debug_vis=False,
+    )
+    # Rough runner uses 96 control steps per iteration.
+    disturbance_curriculum_steps = 144_000

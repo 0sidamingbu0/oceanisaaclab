@@ -12,6 +12,7 @@ from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import SimulationCfg
+from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils.configclass import configclass
 
 
@@ -38,6 +39,20 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
 
     # simulation
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
+
+    terrain = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="plane",
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=0.5,
+            dynamic_friction=0.5,
+            restitution=0.0,
+        ),
+        debug_vis=False,
+    )
 
     # robot(s)
     robot_cfg: ArticulationCfg = ArticulationCfg(
@@ -97,9 +112,21 @@ class OceanisaaclabEnvCfg(DirectRLEnvCfg):
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=2048, env_spacing=2.0, replicate_physics=True)
 
-    # contact sensor on both feet (leg end links) for gait/air-time rewards
-    contact_sensor: ContactSensorCfg = ContactSensorCfg(
-        prim_path="/World/envs/env_.*/Robot/leg_[lr]5_link",
+    # Feet sensor for gait rewards. Walking adds exact torso/head sensors because
+    # a broad Robot/.* expression also matches nested visual mesh prims in this URDF.
+    right_foot_contact_sensor: ContactSensorCfg = ContactSensorCfg(
+        prim_path=(
+            "/World/envs/env_.*/Robot/Geometry/base_link/leg_r1_link/leg_r2_link/"
+            "leg_r3_link/leg_r4_link/leg_r5_link"
+        ),
+        history_length=3,
+        track_air_time=True,
+    )
+    left_foot_contact_sensor: ContactSensorCfg = ContactSensorCfg(
+        prim_path=(
+            "/World/envs/env_.*/Robot/Geometry/base_link/leg_l1_link/leg_l2_link/"
+            "leg_l3_link/leg_l4_link/leg_l5_link"
+        ),
         history_length=3,
         track_air_time=True,
     )

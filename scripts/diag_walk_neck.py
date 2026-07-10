@@ -1,7 +1,7 @@
 """Headless 行走诊断（walk env / 14-DOF 带脖子版）：头命令强制=0，测策略是否真抬脚。
 
 针对 07-08 加脖子后 sim2sim 蹭脚问题：验证"追踪残差吃掉 3.5cm 抬脚余量"假设。
-- 加载 Ocean-BDX-Walk-Direct-v0（77 维 obs，3×512 actor），手写 actor 前向避免 runner 版本问题；
+- 加载 Ocean-BDX-Walk-Direct-v0（80 维 obs，3×512 actor），手写 actor 前向避免 runner 版本问题；
 - 头命令 _head_commands 每步清零（复现 sim2sim 无头命令场景）；
 - 关扰动/噪声/延迟，测策略"想做什么"的纯步态意图；
 - 关键量：摆动脚原点离地高度分布 + 对参考步态的 leg 关节追踪残差 Σ(q-q̂)²

@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""路线 B（BDX 论文完整复刻）训练环境。
+"""路线 B（BDX 论文适配复刻）训练环境。
 
 对照迪士尼论文（工程根目录 BD_X_paper.pdf）的 periodic walking policy，固定脖子、
 只训 10 个腿部电机。相对基类（路线 A）替换了全部核心环节：
@@ -116,6 +116,11 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
                 f"gait library period {self._reference_gait.gait_period} != "
                 f"cfg.gait_cycle_period {self.cfg.gait_cycle_period}; regenerate the library."
             )
+        if abs(self._reference_gait.gait_duty - self.cfg.gait_duty_factor) > 1e-6:
+            raise RuntimeError(
+                f"gait library duty {self._reference_gait.gait_duty} != "
+                f"cfg.gait_duty_factor {self.cfg.gait_duty_factor}; regenerate the library."
+            )
 
         # ---- path frame（+x = 头部前向）与朝向约定 ----
         self._path_frame = PathFrame(
@@ -150,6 +155,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         ].clone()
         self._neck_target = self._default_neck_joint_pos.clone()
         self._head_commands = torch.zeros(self.num_envs, 4, device=self.device)
+        self._control_resample_left = torch.zeros(self.num_envs, device=self.device)
         self._head_command_scale = torch.tensor(
             self.cfg.head_command_scale, dtype=torch.float, device=self.device
         ).unsqueeze(0)
@@ -229,7 +235,15 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
                         self.num_envs, body_ids, f_xy, f_z, tq, on_s, off_s, self.device
                     )
                 )
-            self._dist_body_ids = [bid for sched in self._disturbances for bid in sched.body_ids]
+            self._dist_body_ids = sorted({bid for sched in self._disturbances for bid in sched.body_ids})
+            body_slot = {body_id: slot for slot, body_id in enumerate(self._dist_body_ids)}
+            self._dist_body_slots = [
+                torch.tensor([body_slot[bid] for bid in sched.body_ids], device=self.device)
+                for sched in self._disturbances
+            ]
+            wrench_shape = (self.num_envs, len(self._dist_body_ids), 3)
+            self._dist_forces = torch.zeros(wrench_shape, device=self.device)
+            self._dist_torques = torch.zeros(wrench_shape, device=self.device)
 
         # ---- 非对称 critic 特权量（基类 DR 未开时回退到 1） ----
         if not hasattr(self, "_dr_mass_scale"):
@@ -250,7 +264,6 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
                 "leg_joint_pos",
                 "leg_joint_vel",
                 "contact_match",
-                "bootstrap_swing_contact",
                 "torque",
                 "joint_acc",
                 "action_rate",
@@ -263,10 +276,22 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             ]
         }
 
-        # 反射惯量（armature）：先写标称值，reset 时每 episode ±20% 随机
-        self._write_armature(torch.arange(self.num_envs, device=self.device), randomize=False)
+        # Give each parallel environment a randomized reflected inertia once. Rewriting
+        # PhysX articulation properties on every early-policy fall is disproportionately slow.
+        self._write_armature(torch.arange(self.num_envs, device=self.device), randomize=True)
         # path frame 初始化到出生位姿
         self._reset_path_frame(torch.arange(self.num_envs, device=self.device))
+
+        # Episode diagnostics use physical errors/rates rather than reward kernels.
+        self._metric_vel_error = torch.zeros(self.num_envs, device=self.device)
+        self._metric_yaw_error = torch.zeros(self.num_envs, device=self.device)
+        self._metric_left_contact = torch.zeros(self.num_envs, device=self.device)
+        self._metric_right_contact = torch.zeros(self.num_envs, device=self.device)
+        self._metric_double_support = torch.zeros(self.num_envs, device=self.device)
+        self._metric_steps = torch.zeros(self.num_envs, device=self.device)
+        self._metric_action_saturation = torch.zeros(
+            self.num_envs, self.cfg.action_space, device=self.device
+        )
 
     # ------------------------------------------------------------------
     # helpers
@@ -333,6 +358,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         self._prev_prev_actions = self._previous_actions.clone()
         self._previous_actions = self._actions.clone()
         self._actions = actions.clamp(-1.0, 1.0)
+        self._metric_action_saturation += (torch.abs(self._actions) > 0.98).float()
         # 随机动作延迟（保留基类机制：sim2real 通信延迟）
         if self.cfg.enable_action_latency:
             self._action_history = torch.roll(self._action_history, shifts=1, dims=1)
@@ -417,29 +443,17 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
     def _update_paper_disturbances(self) -> None:
         if not self._disturbances:
             return
-        if self.cfg.enable_walk_bootstrap_curriculum:
-            start = self.cfg.walk_curriculum_disturbance_start_step
-            scale = (self.common_step_counter - start) / float(self.cfg.disturbance_curriculum_steps)
-            scale = max(0.0, min(1.0, scale))
-        else:
-            scale = min(1.0, self.common_step_counter / float(self.cfg.disturbance_curriculum_steps))
+        scale = min(1.0, self.common_step_counter / float(self.cfg.disturbance_curriculum_steps))
         for sched in self._disturbances:
             sched.step(self.step_dt, scale)
-        forces = torch.cat([s.forces for s in self._disturbances], dim=1)
-        torques = torch.cat([s.torques for s in self._disturbances], dim=1)
+        self._dist_forces.zero_()
+        self._dist_torques.zero_()
+        for sched, slots in zip(self._disturbances, self._dist_body_slots):
+            self._dist_forces.index_add_(1, slots, sched.forces)
+            self._dist_torques.index_add_(1, slots, sched.torques)
         self.robot.permanent_wrench_composer.set_forces_and_torques(
-            forces, torques, body_ids=self._dist_body_ids, is_global=True
+            self._dist_forces, self._dist_torques, body_ids=self._dist_body_ids, is_global=True
         )
-
-    def _walk_curriculum_stage(self) -> int:
-        if not self.cfg.enable_walk_bootstrap_curriculum:
-            return len(self.cfg.walk_curriculum_stage_steps)
-        stage = 0
-        for boundary in self.cfg.walk_curriculum_stage_steps:
-            if self.common_step_counter < boundary:
-                return stage
-            stage += 1
-        return stage
 
     def _sample_range(self, value_range: tuple[float, float], shape: tuple[int, ...]) -> torch.Tensor:
         lo, hi = value_range
@@ -447,53 +461,77 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             return torch.full(shape, lo, dtype=torch.float, device=self.device)
         return sample_uniform(lo, hi, shape, self.device)
 
-    def _sample_walk_curriculum_commands(self, env_ids: torch.Tensor) -> torch.Tensor:
-        """Override base command sampling with the bootstrap curriculum for walk imitation."""
+    def _resample_controls(self, env_ids: torch.Tensor, initialize_phase: bool = False) -> None:
+        """Sample the full paper control range, including within-episode transitions."""
         n = len(env_ids)
-        stage = self._walk_curriculum_stage()
+        was_moving = self._moving_mask()[env_ids]
         self._commands[env_ids] = 0.0
 
-        vx = self._sample_range(self.cfg.walk_curriculum_vx_ranges[stage], (n,))
+        vx = self._sample_range(self.cfg.command_vx_range, (n,))
         small_vx = torch.abs(vx) < self.cfg.move_command_threshold
         vx[small_vx] = 0.0
 
         non_standing = torch.ones(n, dtype=torch.bool, device=self.device)
-        standing = torch.rand(n, device=self.device) < self.cfg.walk_curriculum_stand_probs[stage]
+        standing = torch.rand(n, device=self.device) < self.cfg.stand_still_prob
         vx[standing] = 0.0
         non_standing[standing] = False
 
-        turn_in_place = (
-            torch.rand(n, device=self.device) < self.cfg.walk_curriculum_turn_probs[stage]
-        ) & non_standing
+        turn_in_place = (torch.rand(n, device=self.device) < self.cfg.turn_in_place_prob) & non_standing
         vx[turn_in_place] = 0.0
 
         moving = non_standing & ~turn_in_place
-        backward = (
-            torch.rand(n, device=self.device) < self.cfg.walk_curriculum_backward_probs[stage]
-        ) & moving
+        backward = (torch.rand(n, device=self.device) < self.cfg.backward_prob) & moving
         vx[backward] *= -1.0
 
         moving_or_turning = ~standing
-        vy = self._sample_range(self.cfg.walk_curriculum_vy_ranges[stage], (n,))
+        vy = self._sample_range(self.cfg.command_vy_range, (n,))
         vy[torch.abs(vy) < self.cfg.move_command_threshold] = 0.0
         vy[turn_in_place] = 0.0
-        wz = self._sample_range(self.cfg.walk_curriculum_wz_ranges[stage], (n,))
+        wz = self._sample_range(self.cfg.command_wz_range, (n,))
 
         self._commands[env_ids, 0] = vx
         self._commands[env_ids[moving_or_turning], 1] = vy[moving_or_turning]
         self._commands[env_ids[moving_or_turning], 2] = wz[moving_or_turning]
         self._is_standing[env_ids] = standing
-        return standing
+        self._head_commands[env_ids, 0] = self._sample_range(self.cfg.head_command_dh_range, (n,))
+        self._head_commands[env_ids, 1] = self._sample_range(self.cfg.head_command_pitch_range, (n,))
+        self._head_commands[env_ids, 2] = self._sample_range(self.cfg.head_command_yaw_range, (n,))
+        self._head_commands[env_ids, 3] = self._sample_range(self.cfg.head_command_roll_range, (n,))
+        self._control_resample_left[env_ids] = self._sample_range(
+            self.cfg.control_resample_interval_s, (n,)
+        )
+
+        newly_moving = (~was_moving & moving_or_turning) | initialize_phase
+        if torch.any(newly_moving):
+            local_ids = torch.nonzero(newly_moving, as_tuple=False).squeeze(-1)
+            selected = env_ids[local_ids]
+            turn = wz[local_ids]
+            left_step_phase = self._reference_gait.gait_duty - 0.5
+            right_step_phase = self._reference_gait.gait_duty
+            random_side = torch.rand(len(selected), device=self.device) < 0.5
+            start_left = torch.where(torch.abs(turn) > 1.0e-4, turn > 0.0, random_side)
+            self._phase[selected] = torch.where(
+                start_left,
+                torch.full_like(turn, left_step_phase),
+                torch.full_like(turn, right_step_phase),
+            )
 
     # ------------------------------------------------------------------
     # observations: paper eq. (8) + phase harmonics + command; asymmetric critic
     # ------------------------------------------------------------------
     def _get_observations(self) -> dict:
+        # The completed transition used the previous command for dynamics and
+        # reward. Resample now so the next policy action sees the new target first.
+        self._control_resample_left -= self.step_dt
+        resample_ids = torch.nonzero(self._control_resample_left <= 0.0, as_tuple=False).squeeze(-1)
+        if len(resample_ids) > 0:
+            self._resample_controls(resample_ids)
         base_xy = self.robot.data.root_pos_w.torch[:, :2]
         head_yaw = self._head_yaw()
         pos_pf, yaw_pf = self._path_frame.base_in_path_frame(base_xy, head_yaw)
         lin_vel = self.robot.data.root_lin_vel_b.torch
         ang_vel = self.robot.data.root_ang_vel_b.torch
+        projected_gravity = self.robot.data.projected_gravity_b.torch
         joint_pos = self.robot.data.joint_pos.torch[:, self._leg_dof_idx]
         joint_vel = self.robot.data.joint_vel.torch[:, self._leg_dof_idx]
         neck_joint_pos = self.robot.data.joint_pos.torch[:, self._neck_dof_idx]
@@ -514,6 +552,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         def assemble(
             pos_pf_t: torch.Tensor,
             yaw_feat_t: torch.Tensor,
+            projected_gravity_t: torch.Tensor,
             lin_vel_t: torch.Tensor,
             ang_vel_t: torch.Tensor,
             joint_pos_t: torch.Tensor,
@@ -523,6 +562,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
                 (
                     pos_pf_t * self.cfg.pos_pf_scale,
                     yaw_feat_t,
+                    projected_gravity_t,
                     lin_vel_t * self.cfg.lin_vel_scale,
                     ang_vel_t * self.cfg.ang_vel_scale,
                     joint_pos_t * self.cfg.dof_pos_scale,
@@ -541,7 +581,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         # critic：无噪声真值 + 特权信息（附录 A：simulation state without noise + friction）
         critic_obs = torch.cat(
             (
-                assemble(pos_pf, yaw_feat, lin_vel, ang_vel, joint_pos, joint_vel),
+                assemble(pos_pf, yaw_feat, projected_gravity, lin_vel, ang_vel, joint_pos, joint_vel),
                 self._dr_friction_scale.unsqueeze(1),
                 self._dr_mass_scale.unsqueeze(1),
             ),
@@ -558,15 +598,23 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             )
             lin_vel_n = lin_vel + torch.randn_like(lin_vel) * self.cfg.noise_lin_vel
             ang_vel_n = ang_vel + torch.randn_like(ang_vel) * self.cfg.noise_ang_vel
+            projected_gravity_n = projected_gravity + torch.randn_like(projected_gravity) * self.cfg.noise_proj_g
             joint_vel_n = joint_vel + torch.randn_like(joint_vel) * self.cfg.noise_joint_vel
-            obs = assemble(pos_pf, yaw_feat, lin_vel_n, ang_vel_n, joint_pos_hat, joint_vel_n)
+            obs = assemble(
+                pos_pf,
+                yaw_feat,
+                projected_gravity_n,
+                lin_vel_n,
+                ang_vel_n,
+                joint_pos_hat,
+                joint_vel_n,
+            )
         else:
             obs = critic_obs[:, : self.cfg.observation_space]
         return {"policy": obs, "critic": critic_obs}
 
     # ------------------------------------------------------------------
-    # dones: paper V-B — terminate only when the torso hits the ground
-    # (equivalent height/tilt test; feet-only contact sensing keeps hardware simple)
+    # dones: paper V-B ground-contact termination adapted to the nested URDF collision geometry
     # ------------------------------------------------------------------
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # path frame 动力学每控制步推进一次（物理步进后、奖励/观测前）
@@ -581,9 +629,11 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         )
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         base_height = self.robot.data.root_pos_w.torch[:, 2] - self.scene.env_origins[:, 2]
-        torso_down = base_height < self.cfg.walk_min_base_height
-        not_upright = -self.robot.data.projected_gravity_b.torch[:, 2] < self.cfg.walk_min_upright_projection
-        return torso_down | not_upright, time_out
+        upright_projection = -self.robot.data.projected_gravity_b.torch[:, 2]
+        terminated = (base_height < self.cfg.walk_min_base_height) | (
+            upright_projection < self.cfg.walk_min_upright_projection
+        )
+        return terminated, time_out
 
     # ------------------------------------------------------------------
     # rewards: paper Table I (leg subset), weights × step_dt
@@ -600,12 +650,12 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         joint_pos = self.robot.data.joint_pos.torch[:, self._leg_dof_idx]
         joint_vel = self.robot.data.joint_vel.torch[:, self._leg_dof_idx]
         joint_acc = self.robot.data.joint_acc.torch[:, self._leg_dof_idx]
+        neck_joint_acc = self.robot.data.joint_acc.torch[:, self._neck_dof_idx]
         neck_joint_pos = self.robot.data.joint_pos.torch[:, self._neck_dof_idx]
         neck_joint_vel = self.robot.data.joint_vel.torch[:, self._neck_dof_idx]
-        neck_ref = self._neck_head_map.sample(self._head_commands)  # (N,4) 头命令→参考脖子角
-        in_contact = (
-            self.contact_sensor.data.current_contact_time.torch[:, self._feet_contact_ids] > 0.0
-        ).float()
+        neck_ref = ref["neck_pos"] + self._neck_head_map.sample(self._head_commands)
+        neck_vel_ref = ref["neck_vel"]
+        in_contact = (self._feet_current_contact_time() > 0.0).float()
 
         # 1) 躯干 path 系 xy 位置模仿（速度跟踪由此隐式实现：path frame 按命令前进）
         pos_err = torch.sum(torch.square(pos_pf - ref["base_pos_pf"]), dim=1)
@@ -632,17 +682,16 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         # 6) 接触匹配：Σᵢ I[cᵢ = ĉᵢ]
         ref_contact = (ref["feet_contact"] >= 0.5).float()
         rew_contact = cfg.rew_w_contact_match * torch.sum((in_contact == ref_contact).float(), dim=1)
-        swing_contact_violation = torch.sum((1.0 - ref_contact) * in_contact, dim=1)
-        if (
-            cfg.enable_bootstrap_swing_contact_penalty
-            and self.common_step_counter < cfg.bootstrap_swing_contact_penalty_until_step
-        ):
-            rew_bootstrap_swing_contact = cfg.rew_w_bootstrap_swing_contact * swing_contact_violation
-        else:
-            rew_bootstrap_swing_contact = torch.zeros_like(rew_contact)
         # 7) 正则：力矩 / 关节加速度 / 动作率 / 动作加速度
-        rew_torque = cfg.rew_w_torque * torch.sum(torch.square(self._applied_leg_torque), dim=1)
-        rew_joint_acc = cfg.rew_w_joint_acc * torch.sum(torch.square(joint_acc), dim=1)
+        neck_torque = self.robot.data.applied_torque.torch[:, self._neck_dof_idx]
+        rew_torque = cfg.rew_w_torque * (
+            torch.sum(torch.square(self._applied_leg_torque), dim=1)
+            + torch.sum(torch.square(neck_torque), dim=1)
+        )
+        rew_joint_acc = cfg.rew_w_joint_acc * (
+            torch.sum(torch.square(joint_acc), dim=1)
+            + torch.sum(torch.square(neck_joint_acc), dim=1)
+        )
         rew_action_rate = cfg.rew_w_action_rate * torch.sum(
             torch.square(self._actions[:, self._leg_action_slice]
                          - self._previous_actions[:, self._leg_action_slice]), dim=1
@@ -655,7 +704,9 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         # 8) 脖子/头部模仿（论文表 I neck 项）：脖子关节角跟随头命令参考角 + 速度惩罚
         #    + 脖子动作率/加速度（腿与脖子动作率分开加权，避免脖子快动作被腿的权重误伤）
         rew_neck_pos = cfg.rew_w_neck_joint_pos * torch.sum(torch.square(neck_joint_pos - neck_ref), dim=1)
-        rew_neck_vel = cfg.rew_w_neck_joint_vel * torch.sum(torch.square(neck_joint_vel), dim=1)
+        rew_neck_vel = cfg.rew_w_neck_joint_vel * torch.sum(
+            torch.square(neck_joint_vel - neck_vel_ref), dim=1
+        )
         rew_neck_action_rate = cfg.rew_w_neck_action_rate * torch.sum(
             torch.square(self._actions[:, self._neck_action_slice]
                          - self._previous_actions[:, self._neck_action_slice]), dim=1
@@ -678,7 +729,6 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             "leg_joint_pos": rew_joint_pos,
             "leg_joint_vel": rew_joint_vel,
             "contact_match": rew_contact,
-            "bootstrap_swing_contact": rew_bootstrap_swing_contact,
             "torque": rew_torque,
             "joint_acc": rew_joint_acc,
             "action_rate": rew_action_rate,
@@ -693,6 +743,13 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         total_reward = torch.stack(list(reward_terms.values()), dim=0).sum(dim=0) * self.step_dt
         for key, value in reward_terms.items():
             self._episode_sums[key] += value * self.step_dt
+        vel_error = torch.linalg.norm(lin_vel[:, :2] - ref["lin_vel_b"][:, :2], dim=1)
+        self._metric_vel_error += vel_error
+        self._metric_yaw_error += torch.abs(ang_vel[:, 2] - ref["ang_vel_b"][:, 2])
+        self._metric_left_contact += in_contact[:, 1]
+        self._metric_right_contact += in_contact[:, 0]
+        self._metric_double_support += torch.prod(in_contact, dim=1)
+        self._metric_steps += 1.0
         return total_reward
 
     # ------------------------------------------------------------------
@@ -711,15 +768,31 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             return  # __init__ 里父类构造期间的首次全量 reset：本类缓冲尚未建立
 
         n = len(env_ids)
-        if self.cfg.enable_walk_bootstrap_curriculum:
-            self._sample_walk_curriculum_commands(env_ids)
-            # Base reset may have seeded root velocity from its generic command sampler.
-            # The walk curriculum owns commands, so clear that seed; RSI below will
-            # overwrite root velocity with the reference velocity for sampled envs.
-            root_vel = self.robot.data.default_root_vel.torch[env_ids].clone()
-            self.robot.write_root_velocity_to_sim_index(root_velocity=root_vel, env_ids=env_ids)
-        # 相位随机偏置
+        metric_steps = self._metric_steps[env_ids].clamp_min(1.0)
+        log = self.extras.setdefault("log", {})
+        log["Metrics/velocity_mae"] = torch.mean(self._metric_vel_error[env_ids] / metric_steps)
+        log["Metrics/yaw_rate_mae"] = torch.mean(self._metric_yaw_error[env_ids] / metric_steps)
+        log["Metrics/left_contact_rate"] = torch.mean(self._metric_left_contact[env_ids] / metric_steps)
+        log["Metrics/right_contact_rate"] = torch.mean(self._metric_right_contact[env_ids] / metric_steps)
+        log["Metrics/double_support_rate"] = torch.mean(self._metric_double_support[env_ids] / metric_steps)
+        saturation = self._metric_action_saturation[env_ids] / metric_steps.unsqueeze(1)
+        for action_id, name in enumerate(self.cfg.leg_joint_names + self.cfg.neck_joint_names):
+            log[f"Metrics/action_saturation/{name}"] = torch.mean(saturation[:, action_id])
+        for metric in (
+            self._metric_vel_error,
+            self._metric_yaw_error,
+            self._metric_left_contact,
+            self._metric_right_contact,
+            self._metric_double_support,
+            self._metric_steps,
+        ):
+            metric[env_ids] = 0.0
+        self._metric_action_saturation[env_ids] = 0.0
+
         self._phase[env_ids] = torch.rand(n, device=self.device)
+        self._resample_controls(env_ids, initialize_phase=True)
+        root_vel = self.robot.data.default_root_vel.torch[env_ids].clone()
+        self.robot.write_root_velocity_to_sim_index(root_velocity=root_vel, env_ids=env_ids)
         # 动作管线缓冲复位
         self._prev_prev_actions[env_ids] = 0.0
         self._target_joint_pos[env_ids] = self._default_leg_joint_pos[env_ids]
@@ -727,40 +800,20 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         self._filtered_joint_target[env_ids] = self._default_leg_joint_pos[env_ids]
         self._last_tau_m[env_ids] = 0.0
         self._applied_leg_torque[env_ids] = 0.0
-        # 头部命令：每 env 采样 4-DOF (Δh, pitch, yaw, roll)，整段 episode 恒定。
-        if self.cfg.enable_walk_bootstrap_curriculum:
-            stage = self._walk_curriculum_stage()
-            self._head_commands[env_ids, 0] = self._sample_range(
-                self.cfg.walk_curriculum_head_dh_ranges[stage], (n,)
-            )
-            self._head_commands[env_ids, 1] = self._sample_range(
-                self.cfg.walk_curriculum_head_pitch_ranges[stage], (n,)
-            )
-            self._head_commands[env_ids, 2] = self._sample_range(
-                self.cfg.walk_curriculum_head_yaw_ranges[stage], (n,)
-            )
-            self._head_commands[env_ids, 3] = self._sample_range(
-                self.cfg.walk_curriculum_head_roll_ranges[stage], (n,)
-            )
-        else:
-            # Legacy head-command curriculum: scale the full configured ranges from 0 to 1.
-            hscale = min(1.0, self.common_step_counter / float(self.cfg.head_command_curriculum_steps))
-            self._head_commands[env_ids, 0] = hscale * sample_uniform(
-                *self.cfg.head_command_dh_range, (n,), self.device
-            )
-            self._head_commands[env_ids, 1] = hscale * sample_uniform(
-                *self.cfg.head_command_pitch_range, (n,), self.device
-            )
-            self._head_commands[env_ids, 2] = hscale * sample_uniform(
-                *self.cfg.head_command_yaw_range, (n,), self.device
-            )
-            self._head_commands[env_ids, 3] = hscale * sample_uniform(
-                *self.cfg.head_command_roll_range, (n,), self.device
-            )
-        # 脖子位置目标复位到该头命令对应的参考角（避免第一步从默认位跳变）
-        neck_ref_reset = self._neck_head_map.sample(self._head_commands[env_ids])
+        reset_ref = self._reference_gait.sample(self._commands[env_ids], self._phase[env_ids])
+        neck_ref_reset = reset_ref["neck_pos"] + self._neck_head_map.sample(self._head_commands[env_ids])
         self._neck_target[env_ids] = neck_ref_reset
-        # 附录 B 每 episode 随机量：编码器偏移 / 背隙 / PD 增益 / 反射惯量
+        reset_actions = torch.zeros(n, self.cfg.action_space, device=self.device)
+        reset_actions[:, self._neck_action_slice] = torch.clamp(
+            (neck_ref_reset - self._default_neck_joint_pos[env_ids]) / self._neck_joint_ranges,
+            -1.0,
+            1.0,
+        )
+        self._actions[env_ids] = reset_actions
+        self._previous_actions[env_ids] = reset_actions
+        self._prev_prev_actions[env_ids] = reset_actions
+        self._action_history[env_ids] = reset_actions.unsqueeze(1)
+        # 附录 B 每 episode 随机量：编码器偏移 / 背隙 / PD 增益。
         self._encoder_offset[env_ids] = (
             torch.rand(n, 10, device=self.device) * 2.0 - 1.0
         ) * self._act_eps_max
@@ -770,19 +823,16 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         lo, hi = self.cfg.actuator_gain_rand_range
         self._gain_scale_kp[env_ids] = sample_uniform(lo, hi, (n, 10), self.device)
         self._gain_scale_kd[env_ids] = sample_uniform(lo, hi, (n, 10), self.device)
-        self._write_armature(env_ids, randomize=True)
+        if self.cfg.randomize_armature_each_reset:
+            self._write_armature(env_ids, randomize=True)
         # 表 V 扰动进程复位
         for sched in self._disturbances:
             sched.reset(env_ids)
 
         # ---- RSI：部分 env 从随机相位参考帧出发 ----
         pf_offset = None
-        if self.cfg.enable_walk_bootstrap_curriculum:
-            rsi_prob = self.cfg.walk_curriculum_rsi_probs[self._walk_curriculum_stage()]
-            rsi_joint_pos_noise = self.cfg.walk_curriculum_rsi_joint_pos_noise[self._walk_curriculum_stage()]
-        else:
-            rsi_prob = self.cfg.rsi_prob
-            rsi_joint_pos_noise = self.cfg.rsi_joint_pos_noise
+        rsi_prob = self.cfg.rsi_prob
+        rsi_joint_pos_noise = self.cfg.rsi_joint_pos_noise
         rsi = torch.rand(n, device=self.device) < rsi_prob
         if torch.any(rsi):
             rsi_ids = env_ids[rsi]
@@ -798,16 +848,16 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             joint_pos[:, self._neck_dof_idx] = neck_ref_reset[rsi]
             joint_vel = self.robot.data.default_joint_vel.torch[rsi_ids].clone()
             joint_vel[:, self._leg_dof_idx] = ref["joint_vel"]
+            joint_vel[:, self._neck_dof_idx] = ref["neck_vel"]
 
-            # 基座位姿：参考高度；朝向沿用 default（正立、head_yaw=offset）。
-            # 不手写四元数（历史 bug：该管线 root_pose 四元数存储顺序与手写假设不一致）。
             root_pose = self.robot.data.default_root_pose.torch[rsi_ids].clone()
             root_pose[:, :3] = self.scene.env_origins[rsi_ids]
             root_pose[:, 2] += ref["base_height"]
+            zeros = torch.zeros_like(ref["base_pitch"])
+            root_pose[:, 3:7] = quat_from_euler_xyz(zeros, ref["base_pitch"], zeros)
             root_vel = self.robot.data.default_root_vel.torch[rsi_ids].clone()
             root_vel[:, :3] = ref["lin_vel_b"]
-            root_vel[:, 3:5] = 0.0
-            root_vel[:, 5] = self._commands[rsi_ids, 2]
+            root_vel[:, 3:6] = ref["ang_vel_b"]
 
             self.robot.write_root_pose_to_sim_index(root_pose=root_pose, env_ids=rsi_ids)
             self.robot.write_root_velocity_to_sim_index(root_velocity=root_vel, env_ids=rsi_ids)
@@ -817,10 +867,18 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             self._target_joint_pos[rsi_ids] = joint_pos[:, self._leg_dof_idx]
             self._prev_target_joint_pos[rsi_ids] = joint_pos[:, self._leg_dof_idx]
             self._filtered_joint_target[rsi_ids] = joint_pos[:, self._leg_dof_idx]
+            rsi_actions = reset_actions[rsi].clone()
+            rsi_actions[:, self._leg_action_slice] = torch.clamp(
+                (joint_pos[:, self._leg_dof_idx] - self._default_leg_joint_pos[rsi_ids])
+                / self._joint_ranges,
+                -1.0,
+                1.0,
+            )
+            self._actions[rsi_ids] = rsi_actions
+            self._previous_actions[rsi_ids] = rsi_actions
+            self._prev_prev_actions[rsi_ids] = rsi_actions
+            self._action_history[rsi_ids] = rsi_actions.unsqueeze(1)
             # path frame 原点偏移，使躯干出生即位于参考 sway 相位上
             pf_offset = torch.zeros(n, 2, device=self.device)
             pf_offset[rsi] = ref["base_pos_pf"]
         self._reset_path_frame(env_ids, pf_offset)
-        if self.cfg.enable_walk_bootstrap_curriculum:
-            self.extras.setdefault("log", {})
-            self.extras["log"]["Curriculum/walk_stage"] = float(self._walk_curriculum_stage())

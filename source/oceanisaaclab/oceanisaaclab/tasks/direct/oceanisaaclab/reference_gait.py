@@ -76,6 +76,13 @@ class ReferenceGait:
             self.phase_rate = torch.full(
                 self.base_height.shape, 1.0 / self.gait_period, dtype=torch.float32, device=self.device
             )
+        if "neck_pos" in data.files:
+            self.neck_pos = tensor("neck_pos")
+            self.neck_vel = tensor("neck_vel")
+        else:
+            shape = (*self.joint_pos.shape[:4], 4)
+            self.neck_pos = torch.zeros(shape, dtype=torch.float32, device=self.device)
+            self.neck_vel = torch.zeros_like(self.neck_pos)
 
     @staticmethod
     def _grid_coords(values: torch.Tensor, grid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -133,12 +140,18 @@ class ReferenceGait:
             "feet_contact": lerp_phase_table(self.feet_contact),
             "base_pos_pf": lerp_phase_table(self.base_pos_pf),
             "base_yaw_pf": lerp_phase_table(self.base_yaw_pf).squeeze(-1),
-            "lin_vel_b": lerp_table(self.lin_vel_b),
-            "ang_vel_b": lerp_table(self.ang_vel_b),
+            "lin_vel_b": (
+                lerp_phase_table(self.lin_vel_b) if self.lin_vel_b.dim() == 5 else lerp_table(self.lin_vel_b)
+            ),
+            "ang_vel_b": (
+                lerp_phase_table(self.ang_vel_b) if self.ang_vel_b.dim() == 5 else lerp_table(self.ang_vel_b)
+            ),
             "proj_g": lerp_table(self.proj_g),
             "base_height": lerp_table(self.base_height),
             "base_pitch": lerp_table(self.base_pitch),
             "phase_rate": lerp_table(self.phase_rate),
+            "neck_pos": lerp_phase_table(self.neck_pos),
+            "neck_vel": lerp_phase_table(self.neck_vel),
         }
 
     def sample_phase_rate(self, commands: torch.Tensor) -> torch.Tensor:
@@ -233,4 +246,3 @@ class StandPose:
                         corner = self.joint_pos[ch, cp, cy, cr]  # (N, 10)
                         out = corner * weight if out is None else out + corner * weight
         return out
-

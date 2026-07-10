@@ -8,7 +8,7 @@
 论文 divide-and-conquer：periodic 行走策略之外单独训练 perpetual 站立策略
 π(a | s, g_perp)，**无相位**、脚不迈步，命令 g_perp = (Δh_head, Δθ_head, h_torso,
 θ_torso)（式 5）。继承行走环境 OceanisaaclabWalkEnv，复用附录 B 执行器模型、表 V 扰动、
-域随机化、torso 触地终止、非对称 critic、path frame、脖子位置伺服、脖子/头部命令映射；
+域随机化、torso 等效触地终止、非对称 critic、path frame、脖子位置伺服、脖子/头部命令映射；
 覆盖：观测（去相位谐波、命令换 torso4+head4）、奖励（静态姿态模仿）、reset（站立命令
 采样 + 从标称站姿出生）。行走的动作管线 / 执行器模型 / 脖子通路完全沿用。
 """
@@ -143,9 +143,7 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         joint_acc = self.robot.data.joint_acc.torch[:, self._leg_dof_idx]
         neck_joint_pos = self.robot.data.joint_pos.torch[:, self._neck_dof_idx]
         neck_joint_vel = self.robot.data.joint_vel.torch[:, self._neck_dof_idx]
-        in_contact = (
-            self.contact_sensor.data.current_contact_time.torch[:, self._feet_contact_ids] > 0.0
-        ).float()
+        in_contact = (self._feet_current_contact_time() > 0.0).float()
 
         # 命令：躯干 (h, pitch, yaw, roll)
         h_cmd = self._torso_commands[:, 0]

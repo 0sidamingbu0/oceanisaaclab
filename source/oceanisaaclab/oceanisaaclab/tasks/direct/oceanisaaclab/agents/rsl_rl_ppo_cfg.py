@@ -9,6 +9,19 @@ from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPp
 
 
 @configclass
+class SquashedGaussianDistributionCfg(RslRlMLPModelCfg.DistributionCfg):
+    """Configuration for the bounded action distribution used by walking."""
+
+    class_name: str = (
+        "oceanisaaclab.tasks.direct.oceanisaaclab.agents.squashed_gaussian:"
+        "SquashedGaussianDistribution"
+    )
+    init_std: float = 0.3
+    min_std: float = 0.03
+    max_std: float = 0.6
+
+
+@configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
     max_iterations = 20000
@@ -18,7 +31,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         hidden_dims=[256, 128, 64],
         activation="elu",
         obs_normalization=True,
-        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.3, std_type="log"),
+        distribution_cfg=SquashedGaussianDistributionCfg(),
     )
     critic = RslRlMLPModelCfg(
         hidden_dims=[256, 128, 64],
@@ -51,16 +64,19 @@ class WalkPPORunnerCfg(PPORunnerCfg):
       GAE λ 0.95、自适应学习率（目标 KL 0.01）、梯度范数 1.0；
     - 非对称 critic：critic 观测组用环境返回的 "critic"（无噪声观测 + 摩擦/质量
       随机化系数特权信息）。
-    - batch 8192×24 需要以 --num_envs 8192 启动训练。
+    - 平面预训练使用论文配置 8192×24；粗糙地形微调由 WalkRoughPPORunnerCfg
+      使用 2048×96，两者每次 update 都是 196,608 samples。
     """
 
+    num_steps_per_env = 24
+    max_iterations = 100000
     experiment_name = "bdx_walk_imitation"
     obs_groups = {"policy": ["policy"], "critic": ["critic"]}
     actor = RslRlMLPModelCfg(
         hidden_dims=[512, 512, 512],
         activation="elu",
         obs_normalization=True,
-        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.3, std_type="log"),
+        distribution_cfg=SquashedGaussianDistributionCfg(),
     )
     critic = RslRlMLPModelCfg(
         hidden_dims=[512, 512, 512],
@@ -71,13 +87,7 @@ class WalkPPORunnerCfg(PPORunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        # 论文原值 0；但 07-07 复盘发现 5800 iter 时 mean_std 从 init 0.3 塌到 0.013、
-        # entropy -29，在发现"迈步比站着值"之前探索就死了、锁死站立局部最优。
-        # 加小 entropy_coef 恢复逃出盆地的能力（值取小以防重新引入不稳定）。
-        # 07-08：加脖子(14-DOF)后 13000 iter 腿动作 std 塌到 0.044（加脖子前同期 0.066）、
-        # 探索死得更早锁进蹭步局部最优（见 memory ocean-neck-walk-gait-regression）。配合头命令
-        # 课程，把 entropy_coef 0.005→0.008 作保险，延长关键步态涌现期的探索（仍取小防失稳）。
-        entropy_coef=0.008,
+        entropy_coef=0.0,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=3.0e-4,
@@ -87,6 +97,13 @@ class WalkPPORunnerCfg(PPORunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class WalkRoughPPORunnerCfg(WalkPPORunnerCfg):
+    """Rough-terrain fine-tuning with the same total PPO batch as flat training."""
+
+    num_steps_per_env = 96
 
 
 @configclass

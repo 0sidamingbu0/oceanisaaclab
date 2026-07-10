@@ -27,12 +27,13 @@
 | 任务 id | 路线 | 范式 | 训练日志目录 |
 |---|---|---|---|
 | `Ocean-BDX-Stand-Direct-v0` | 路线 A | 手工塑形奖励（速度跟踪 + 步态相位 + 稳定性等 20+ 项），观测 41 维 | `logs/rsl_rl/bdx_walk_phase/` |
-| `Ocean-BDX-Walk-Direct-v0` | 路线 B（行走） | **BDX 论文完整复刻** periodic 行走策略（path frame + 表 I 模仿奖励 + 附录 B 执行器模型），观测 77 维、动作 14（含脖子+头部命令） | `logs/rsl_rl/bdx_walk_imitation/` |
+| `Ocean-BDX-Walk-Direct-v0` | 路线 B（行走预训练） | 论文 periodic 行走策略，平面 `8192×24` 高吞吐预训练，观测 80 维、动作 14 | `logs/rsl_rl/bdx_walk_imitation/` |
+| `Ocean-BDX-WalkRough-Direct-v0` | 路线 B（粗糙地形微调） | 与行走预训练相同接口，50% 平面 + 50% `±12mm` 连续粗糙面，`2048×96` | `logs/rsl_rl/bdx_walk_imitation/` |
 | `Ocean-BDX-StandPaper-Direct-v0` | 路线 B（站立） | **BDX 论文 perpetual 站立策略**（无相位，命令 g_perp=躯干4+头部4），观测 74 维、动作 14 | `logs/rsl_rl/bdx_stand_perpetual/` |
 
 本项目不装足底接触开关，观测里不含双足接触量（接触只用于奖励）。
 
-路线 B 按论文 divide-and-conquer 拆成**两个独立模型**：periodic 行走 + perpetual 站立，运行时按需切换（论文图 9）。2026-07-08 起脖子（4 关节）已纳入策略控制并加入 4-DOF 头部命令（Δh 头高 / pitch 点头 / yaw 摇头 / roll 歪头），故行走观测由 57→77、动作 10→14；早期"脖子固定、只训 10 电机、观测 57 维"的描述已作废（见 changelog 2026-07-08）。
+路线 B 按论文 divide-and-conquer 拆成**两个独立模型**：periodic 行走 + perpetual 站立，运行时按需切换（论文图 9）。2026-07-10 行走观测加入 projected gravity，由 77→80；动作保持 14 维。旧 77 维 checkpoint 与 ONNX 均不兼容，必须重新训练和导出。
 
 ### 路线 B（行走）：BDX 论文复刻 `Ocean-BDX-Walk-Direct-v0`
 
@@ -41,11 +42,12 @@
 
 - **path frame**（论文 V-A / Fig.4）：行走按命令速度积分推进、站立收敛到双脚中心、
   最大偏差投影拉回；速度跟踪由「躯干贴住 path 系参考位置」隐式实现，无显式速度跟踪奖励。
-- **观测 77 维**（论文式 (8) + 附录 A；2026-07-08 加脖子+头部命令后由 57→77）：
-  path 系躯干 xy(2) + path 系 yaw sin/cos(2) + body 系线速度(3) + body 系角速度(3)
+- **观测 80 维**（论文式 (8) + 附录 A）：
+  path 系躯干 xy(2) + path 系 yaw sin/cos(2) + projected gravity(3)
+  + body 系线速度(3) + body 系角速度(3)
   + 腿 q(10) + 脖子 q(4) + 腿 q̇(10) + 脖子 q̇(4) + a_{t-1}(14) + a_{t-2}(14)
   + 相位二阶谐波 sin/cos(2πφ),sin/cos(4πφ)(4) + 命令 vx,vy,wz(3) + 头部命令(4)。
-  非对称 critic 额外收无噪声观测 + 摩擦/质量随机化系数（79 维）。
+  非对称 critic 额外收无噪声观测 + 摩擦/质量随机化系数（82 维）。
 - **动作 14 维**：10 腿（力矩直驱）+ 4 脖子（位置伺服，跟随头部命令参考角）。
 - **头部命令 4-DOF**（论文 g_peri 的 Δh_head/Δθ_head）：Δh 头高 / pitch 点头 / yaw 摇头 /
   roll 歪头。命令→脖子参考角由 `neck_head_map.npz` 四线性插值提供（脚与脖子 IK 解耦，
@@ -60,19 +62,30 @@
 - **执行器模型**（附录 B / 表 VI，Unitree A1/Go1 辨识参数；髋 roll/pitch/膝=A1、
   髋 yaw/踝=Go1；**本机电机若非同款需重新辨识**）：软件 PD + 编码器偏移 ±0.02rad +
   tanh 摩擦 + 速度相关力矩限幅 + 背隙/速度相关噪声编码器读数 + 反射惯量 ±20%，
-  全部每 episode 重采样。
+  编码器/背隙/PD 增益每 episode 重采样；反射惯量在每个并行环境初始化时随机一次，避免
+  高频跌倒 reset 时反复写 PhysX articulation 属性。
 - **扰动 = 论文表 V** 三档独立进程（髋/脚短小、盆骨长小、盆骨短大推力；大推力按整机
   质量 ≈10/15.4 缩放为 58~97N），前 1500 iter 线性课程。
-- **相位速率 φ̇ 按命令从参考库插值**逐步积分（库默认恒定步频；`gen_reference_gait.py
-  --gait-period-fast` 可生成速度相关步频库）。
+- **相位速率 φ̇ 按命令从参考库插值**逐步积分，周期从零速 0.6s 连续缩短到满速
+  0.48s；接触占空比 0.6，对应约 20% 双支撑窗口。
 - PPO/网络对齐论文表 IV：actor/critic 各 3×512 ELU、epoch 5、entropy 0、自适应
-  lr（KL 0.01）、batch 8192 env × 24 steps。
+  lr（KL 0.01）。平面预训练恢复论文 `8192 env × 24 steps`；策略稳定后切到粗糙地形任务，
+  用 `2048 env × 96 steps` 控制接触峰值。两阶段每次 update 都是 196,608 个样本。
+  论文最终每个策略训练 100,000 iterations；1,500 iter 只用于预览 nominal behavior。
 
-- 训练（从头训，观测/奖励/动作语义与旧 checkpoint 全部不兼容，不 resume）：
+- 第一阶段：平面高速预训练（从头训，旧 77 维 checkpoint 不兼容）：
 
     ```bash
     ./_isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py \
-      --task Ocean-BDX-Walk-Direct-v0 --num_envs 8192 --max_iterations 20000 --headless
+      --task Ocean-BDX-Walk-Direct-v0 --num_envs 8192 --max_iterations 100000 --headless
+    ```
+
+- 第二阶段：当 `fall_rate` 已明显下降、步态成形后，从平面 checkpoint 进入粗糙地形微调：
+
+    ```bash
+    ./_isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py \
+      --task Ocean-BDX-WalkRough-Direct-v0 --num_envs 2048 --max_iterations 100000 \
+      --resume --load_run <平面run目录名> --checkpoint model_<iter>.pt --headless
     ```
 
 - 回放训练好的策略（play）：
@@ -87,7 +100,7 @@
 
 论文 divide-and-conquer 的第二个独立策略 π(a | s, g_perp)：**无相位**、脚不迈步，专管
 「摆站姿 + 转头」。与行走策略共用机器人模型与整套 sim2real 机制（附录 B 执行器模型、
-表 V 扰动、域随机化、torso 触地终止、非对称 critic、path frame、脖子位置伺服）。
+表 V 扰动、域随机化、torso 等效触地终止、非对称 critic、path frame、脖子位置伺服）。
 
 - **命令 g_perp（8 维）**：躯干 4-DOF（h 高度 / pitch 前后倾 / yaw 偏航 / roll 侧倾）
   + 头部 4-DOF（Δh / pitch / yaw / roll，复用 `neck_head_map`）。
@@ -101,7 +114,7 @@
     ```bash
     # 训练（与行走各训各的，运行时按需切换策略）
     ./_isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py \
-      --task Ocean-BDX-StandPaper-Direct-v0 --num_envs 8192 --max_iterations 20000 --headless
+      --task Ocean-BDX-StandPaper-Direct-v0 --num_envs 8192 --max_iterations 100000 --headless
     # 回放
     ./_isaaclab/isaaclab.sh -p scripts/rsl_rl/play.py \
       --task Ocean-BDX-StandPaper-Direct-v0 --num_envs 16 --viz kit \
@@ -111,13 +124,12 @@
 ### 路线 B 部署（sim2sim / sim2real）：命令如何控制前后左右
 
 常见误解澄清：**参考库只在训练时用**（算模仿奖励 + RSI 重置），参考轨迹**从来不进观测**，
-部署侧**不需要**「按 cmd 修改观测里的参考轨迹」。速度命令 (vx, vy, wz) **在 77 维观测的
-[70:73] 位**（× `command_scale=(2,2,1)`），头部命令 (Δh, pitch, yaw, roll) 在 **[73:77] 位**
-（× `head_command_scale`），都没有被去掉。sim2sim 侧（oceanbdx 仓库）已同步到 77 维/14 动作。
+部署侧**不需要**「按 cmd 修改观测里的参考轨迹」。速度命令 (vx, vy, wz) 在 80 维观测的
+`[73:76]`，头部命令在 `[76:80]`。sim2sim 已同步到 80 维/14 动作。
 
 速度命令通过三条通道同时作用于策略，部署程序必须全部复刻（头部命令另见下方第 4 条）：
 
-1. **观测 [70:73] = cmd × command_scale**：遥控器 / 上层直接写入。命令为头部系
+1. **观测 [73:76] = cmd × command_scale**：遥控器 / 上层直接写入。命令为头部系
    （vx 头前向 +、vy 头左向 +、wz 逆时针 +，单位 m/s、rad/s），训练范围
    vx∈[-0.25,0.25]、vy∈[-0.15,0.15]、wz∈[-0.8,0.8]，部署侧应同样限幅。
 2. **path frame 按 cmd 积分** → 观测第 1~4 维（path 系躯干 xy×`pos_pf_scale=4.0`、
@@ -136,7 +148,7 @@
    1/gait_period）。每策略步 φ ← (φ + φ̇·0.02) mod 1。零命令时相位照常推进
    （与训练一致，参考在零命令网格点本来就是常量站立帧）。
 
-此外，**头部命令 (Δh, pitch, yaw, roll)** 走独立通道：观测 [73:77] = head_cmd ×
+此外，**头部命令 (Δh, pitch, yaw, roll)** 走独立通道：观测 `[76:80] = head_cmd ×`
 `head_command_scale`（遥控器/上层写入），同时脖子 4 关节由策略动作后 4 维直接位置伺服
 控制（训练时脖子模仿 `neck_head_map` 的头部命令→脖子角，部署侧脖子跟着策略输出走即可，
 **不需要**在部署时查 `neck_head_map`）。头部命令不驱动 path frame（只影响脖子/头姿）。
@@ -144,7 +156,7 @@
 部署侧需要从 `reference_gait.npz` 读取的只有 `phase_rate` + 三根网格轴
 （`vx_grid/vy_grid/wz_grid`）；`joint_pos` 等轨迹表、`neck_head_map.npz`、`stand_pose.npz`
 都**不用**在行走部署时加载（它们只在训练/生成阶段用）。sim2sim 参考实现见 oceanbdx 仓库
-`sim2sim/mujoco_sim.py`（已同步 77 维 / 14 动作 / 头部命令键盘控制）。
+`sim2sim/mujoco_sim.py`（已同步 80 维 / 14 动作 / 头部命令键盘控制）。
 
 ### 路线 A：手工塑形 `Ocean-BDX-Stand-Direct-v0`
 
@@ -205,5 +217,3 @@ meshcat（打开日志里打印的 `http://127.0.0.1:7000/static/` 观看）。
 目的：记录每天改了什么、为什么改、改动效果如何，便于理解工程的历史上下文，也方便其他工程师快速了解本工程的演进履历。
 
 每个日志建议包含：改动背景与动机、涉及文件、具体改动、验证方式、训练/实验观察、待办与建议。
-
-

@@ -13,10 +13,9 @@ from collections.abc import Sequence
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
-from isaaclab.sensors import ContactSensor
-from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import sample_uniform
 
+from .nested_contact_sensor import NestedBodyContactSensor
 from .oceanisaaclab_env_cfg import OceanisaaclabEnvCfg
 
 
@@ -31,9 +30,6 @@ class OceanisaaclabEnv(DirectRLEnv):
         self._base_body_id, _ = self.robot.find_bodies("base_link")
         # feet indices: keep articulation and contact-sensor orderings aligned (r5 then l5)
         self._feet_body_ids, _ = self.robot.find_bodies(["leg_r5_link", "leg_l5_link"], preserve_order=True)
-        self._feet_contact_ids, _ = self.contact_sensor.find_sensors(
-            ["leg_r5_link", "leg_l5_link"], preserve_order=True
-        )
 
         self._actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._previous_actions = torch.zeros_like(self._actions)
@@ -161,6 +157,42 @@ class OceanisaaclabEnv(DirectRLEnv):
 
             omni.log.warn("domain rand: robot has no root_physx_view; skipping friction randomization.")
 
+    def _feet_current_contact_time(self) -> torch.Tensor:
+        return torch.cat(
+            (
+                self.right_foot_contact_sensor.data.current_contact_time.torch,
+                self.left_foot_contact_sensor.data.current_contact_time.torch,
+            ),
+            dim=1,
+        )
+
+    def _feet_last_air_time(self) -> torch.Tensor:
+        return torch.cat(
+            (
+                self.right_foot_contact_sensor.data.last_air_time.torch,
+                self.left_foot_contact_sensor.data.last_air_time.torch,
+            ),
+            dim=1,
+        )
+
+    def _feet_first_contact(self) -> torch.Tensor:
+        return torch.cat(
+            (
+                self.right_foot_contact_sensor.compute_first_contact(self.step_dt).torch,
+                self.left_foot_contact_sensor.compute_first_contact(self.step_dt).torch,
+            ),
+            dim=1,
+        )
+
+    def _feet_net_forces_history(self) -> torch.Tensor:
+        return torch.cat(
+            (
+                self.right_foot_contact_sensor.data.net_forces_w_history.torch,
+                self.left_foot_contact_sensor.data.net_forces_w_history.torch,
+            ),
+            dim=2,
+        )
+
     def _find_joint_ids(self, joint_names: Sequence[str]) -> list[int]:
         joint_ids = []
         for joint_name in joint_names:
@@ -172,41 +204,56 @@ class OceanisaaclabEnv(DirectRLEnv):
 
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
-        # The URDF import nests the leg links under base_link, so IsaacLab's
-        # activate_contact_sensors BFS stops at base_link and never tags the feet.
-        # Manually add the contact-report API to the foot prims on the env_0 source
-        # before cloning so all clones inherit it.
-        self._activate_feet_contact_sensors("/World/envs/env_0/Robot")
-        self.contact_sensor = ContactSensor(self.cfg.contact_sensor)
-        # add ground plane
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+        sensor_cfgs = [self.cfg.right_foot_contact_sensor, self.cfg.left_foot_contact_sensor]
+        if hasattr(self.cfg, "torso_ground_contact_sensor"):
+            sensor_cfgs.extend(
+                (self.cfg.torso_ground_contact_sensor, self.cfg.head_ground_contact_sensor)
+            )
+        # The URDF importer preserves the link hierarchy. Tag the exact source
+        # rigid bodies before cloning so every environment inherits contact reporting.
+        sensor_body_names = {sensor_cfg.prim_path.rsplit("/", 1)[-1] for sensor_cfg in sensor_cfgs}
+        self._activate_contact_sensors("/World/envs/env_0/Robot", sensor_body_names)
+        self.right_foot_contact_sensor = NestedBodyContactSensor(self.cfg.right_foot_contact_sensor)
+        self.left_foot_contact_sensor = NestedBodyContactSensor(self.cfg.left_foot_contact_sensor)
+        if hasattr(self.cfg, "torso_ground_contact_sensor"):
+            self.torso_ground_contact_sensor = NestedBodyContactSensor(
+                self.cfg.torso_ground_contact_sensor
+            )
+            self.head_ground_contact_sensor = NestedBodyContactSensor(self.cfg.head_ground_contact_sensor)
+        self.cfg.terrain.num_envs = self.scene.cfg.num_envs
+        self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
+        self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+        self.scene._terrain = self._terrain
         # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
         # we need to explicitly filter collisions for CPU simulation
         if self.device == "cpu":
-            self.scene.filter_collisions(global_prim_paths=[])
+            self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
         # add articulation to scene
         self.scene.articulations["robot"] = self.robot
-        self.scene.sensors["contact_sensor"] = self.contact_sensor
+        self.scene.sensors["right_foot_contact_sensor"] = self.right_foot_contact_sensor
+        self.scene.sensors["left_foot_contact_sensor"] = self.left_foot_contact_sensor
+        if hasattr(self, "torso_ground_contact_sensor"):
+            self.scene.sensors["torso_ground_contact_sensor"] = self.torso_ground_contact_sensor
+            self.scene.sensors["head_ground_contact_sensor"] = self.head_ground_contact_sensor
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-    def _activate_feet_contact_sensors(self, robot_prim_path: str) -> None:
-        """Add the PhysX contact-report API to the foot rigid-body prims.
+    def _activate_contact_sensors(self, robot_prim_path: str, body_names: set[str]) -> None:
+        """Add the PhysX contact-report API to selected nested rigid bodies.
 
         ``activate_contact_sensors`` only tags the top-most rigid body (base_link) for
-        this robot's nested link hierarchy, so the feet are tagged explicitly here.
+        this robot's nested link hierarchy, so the configured bodies are tagged here.
         """
         from pxr import UsdPhysics
 
         stage = sim_utils.get_current_stage()
-        foot_names = ("leg_r5_link", "leg_l5_link")
         tagged = 0
         for prim in stage.Traverse():
             if not prim.GetPath().pathString.startswith(robot_prim_path):
                 continue
-            if prim.GetName() not in foot_names:
+            if prim.GetName() not in body_names:
                 continue
             if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
                 continue
@@ -216,10 +263,10 @@ class OceanisaaclabEnv(DirectRLEnv):
             if "PhysxContactReportAPI" not in applied:
                 prim.AddAppliedSchema("PhysxContactReportAPI")
             tagged += 1
-        if tagged != len(foot_names):
+        if tagged != len(body_names):
             raise RuntimeError(
-                f"Expected to tag {len(foot_names)} foot prims for contact sensing under "
-                f"'{robot_prim_path}', tagged {tagged}. Check foot link names."
+                f"Expected to tag {len(body_names)} rigid bodies for contact sensing under "
+                f"'{robot_prim_path}', tagged {tagged}. Check link names."
             )
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -364,9 +411,9 @@ class OceanisaaclabEnv(DirectRLEnv):
 
     def _get_rewards(self) -> torch.Tensor:
         # contact / air-time data for the two feet (contact-sensor index space)
-        air_time = self.contact_sensor.data.last_air_time.torch[:, self._feet_contact_ids]
-        contact_time = self.contact_sensor.data.current_contact_time.torch[:, self._feet_contact_ids]
-        first_contact = self.contact_sensor.compute_first_contact(self.step_dt).torch[:, self._feet_contact_ids]
+        air_time = self._feet_last_air_time()
+        contact_time = self._feet_current_contact_time()
+        first_contact = self._feet_first_contact()
         in_contact = contact_time > 0.0
         # foot horizontal velocity (articulation index space, aligned order)
         feet_lin_vel = self.robot.data.body_lin_vel_w.torch[:, self._feet_body_ids, :2]
@@ -382,7 +429,7 @@ class OceanisaaclabEnv(DirectRLEnv):
         # contact-force rate: norm of frame-to-frame change in foot contact force.
         # history shape (N, T, num_sensors, 3); penalizing this directly damps the
         # rapid force jumps that cause sim2real standing jitter/oscillation.
-        force_hist = self.contact_sensor.data.net_forces_w_history.torch[:, :, self._feet_contact_ids, :]
+        force_hist = self._feet_net_forces_history()
         force_diff = force_hist[:, :-1] - force_hist[:, 1:]
         contact_force_rate = torch.sum(torch.norm(force_diff, dim=-1), dim=(1, 2))
 
@@ -592,8 +639,13 @@ class OceanisaaclabEnv(DirectRLEnv):
             episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
             extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
             self._episode_sums[key][env_ids] = 0.0
-        extras["Episode_Termination/fall"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
-        extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
+        denominator = max(1, len(env_ids))
+        extras["Episode_Termination/fall_rate"] = (
+            torch.count_nonzero(self.reset_terminated[env_ids]).item() / denominator
+        )
+        extras["Episode_Termination/time_out_rate"] = (
+            torch.count_nonzero(self.reset_time_outs[env_ids]).item() / denominator
+        )
         self.extras["log"] = extras
 
     def _gait_phase(self) -> torch.Tensor:

@@ -90,6 +90,14 @@ args_cli, remaining_args = setup_preset_cli(parser)
 if args_cli.video:
     args_cli.enable_cameras = True
 
+# The nested URDF foot views emit one known path-reconstruction warning per foot and
+# environment during asynchronous PhysX initialization. Suppress only that warning
+# channel for the walking tasks; PhysX errors and other warning channels remain visible.
+if args_cli.task in {"Ocean-BDX-Walk-Direct-v0", "Ocean-BDX-WalkRough-Direct-v0"}:
+    nested_contact_log_filter = "--/log/channels/omni.physx.tensors.plugin=error"
+    if nested_contact_log_filter not in args_cli.kit_args:
+        args_cli.kit_args = f"{args_cli.kit_args} {nested_contact_log_filter}".strip()
+
 
 # Call an external callback if requested. This gives opportunity to external code to register the environments
 # The function is expected to return a list of arguments that were not consumed by the callback.
