@@ -115,6 +115,19 @@ def run(argv: list[str]) -> None:
     installed_version = _check_rsl_rl_version()
     env_cfg, agent_cfg = resolve_task_config(args_cli.task, args_cli.agent)
 
+    def restore_env_curriculum_progress(checkpoint_path: str) -> None:
+        """Restore environment-only curriculum progress that RSL-RL does not checkpoint."""
+        if not getattr(env_cfg, "enable_contact_match_curriculum", False):
+            return
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        completed_iterations = int(checkpoint.get("iter", 0))
+        env_cfg.contact_match_curriculum_step_offset = completed_iterations * agent_cfg.num_steps_per_env
+        print(
+            "[INFO]: Restored contact-match curriculum at "
+            f"{env_cfg.contact_match_curriculum_step_offset} control steps "
+            f"from checkpoint iteration {completed_iterations}."
+        )
+
     with launch_simulation(env_cfg, args_cli):
         agent_cfg = CLI_ARGS.update_rsl_rl_cfg(agent_cfg, args_cli)
         apply_env_overrides(args_cli, env_cfg)
@@ -146,15 +159,16 @@ def run(argv: list[str]) -> None:
         configure_io_descriptors(env_cfg, args_cli, logger)
         env_cfg.log_dir = log_dir
 
+        if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+            restore_env_curriculum_progress(resume_path)
+
         env = create_isaaclab_env(
             args_cli.task,
             env_cfg,
             args_cli,
             convert_marl_to_single_agent=isinstance(env_cfg, DirectMARLEnvCfg),
         )
-
-        if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
         env = wrap_record_video(env, log_dir, args_cli)
 

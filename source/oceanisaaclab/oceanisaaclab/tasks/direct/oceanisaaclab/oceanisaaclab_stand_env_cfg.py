@@ -83,6 +83,7 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     rew_w_leg_joint_pos = -15.0  # 腿关节角模仿站立参考（负 L2）
     rew_w_leg_joint_vel = -1.0e-3
     rew_w_contact_match = 1.0  # 双脚均着地 Σ I[c=1]（站立参考接触恒 [1,1]）
+    enable_contact_match_curriculum = False  # perpetual stand 不使用行走接触课程
     rew_w_torque = -1.0e-3
     rew_w_joint_acc = -2.5e-6
     rew_w_action_rate = -1.5

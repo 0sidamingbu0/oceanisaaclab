@@ -44,6 +44,17 @@ cfg.sim.device = args.device if args.device else "cuda:0"
 cfg.enable_paper_disturbance = False
 cfg.enable_obs_noise = False
 cfg.enable_action_latency = False
+cfg.command_vx_range = (args.vx, args.vx)
+cfg.command_vy_range = (args.vy, args.vy)
+cfg.command_wz_range = (args.wz, args.wz)
+cfg.backward_prob = 0.0
+cfg.stand_still_prob = 0.0
+cfg.turn_in_place_prob = 0.0
+cfg.head_command_dh_range = (0.0, 0.0)
+cfg.head_command_pitch_range = (0.0, 0.0)
+cfg.head_command_yaw_range = (0.0, 0.0)
+cfg.head_command_roll_range = (0.0, 0.0)
+cfg.control_resample_interval_s = (1.0e6, 1.0e6)
 
 env = gym.make("Ocean-BDX-Walk-Direct-v0", cfg=cfg).unwrapped
 
@@ -64,7 +75,7 @@ def policy(o):
     x = elu(torch.nn.functional.linear(x, W0, b0))
     x = elu(torch.nn.functional.linear(x, W2, b2))
     x = elu(torch.nn.functional.linear(x, W4, b4))
-    return torch.nn.functional.linear(x, W6, b6)
+    return torch.tanh(torch.nn.functional.linear(x, W6, b6))
 
 
 cmd = torch.tensor([args.vx, args.vy, args.wz], device=dev)
@@ -73,7 +84,6 @@ env._commands[:] = cmd
 env._head_commands[:] = 0.0  # 强制无头命令
 obs = env._get_observations()["policy"]
 feet = env._feet_body_ids
-feet_c = env._feet_contact_ids
 
 fwd, base_h, ang_xy = [], [], []
 foot_h_swing, in_contact_frac = [], []
@@ -85,18 +95,19 @@ for t in range(args.steps):
         actions = policy(obs)
         env._commands[:] = cmd
         env._head_commands[:] = 0.0
-        env.step(actions)
+        env._control_resample_left.fill_(1.0e6)
+        obs_dict, _, _, _, _ = env.step(actions)
         env._commands[:] = cmd
         env._head_commands[:] = 0.0
-        obs = env._get_observations()["policy"]
+        env._control_resample_left.fill_(1.0e6)
+        obs = obs_dict["policy"]
     if t < warmup:
         continue
     fwd.append(cfg.forward_vx_sign * env.robot.data.root_lin_vel_b.torch[:, 0])
     base_h.append(env.robot.data.root_pos_w.torch[:, 2])
     ang_xy.append(torch.norm(env.robot.data.root_ang_vel_b.torch[:, :2], dim=1))
     fh = env.robot.data.body_pos_w.torch[:, feet, 2] - env.scene.env_origins[:, 2].unsqueeze(1)
-    fnorm = torch.norm(env.contact_sensor.data.net_forces_w.torch[:, feet_c, :], dim=-1)
-    in_c = fnorm > 1.0
+    in_c = env._feet_current_contact_time() > 0.0
     swing = fh.clone()
     swing[in_c] = float("nan")
     foot_h_swing.append(swing)
@@ -136,7 +147,7 @@ print(f"checkpoint: {args.checkpoint}")
 print(f"cmd vx={args.vx} vy={args.vy} wz={args.wz}  envs={args.num_envs}  steps={args.steps-warmup}")
 print(f"\n[跟踪] 前进 vx mean={FWD.mean():.3f} std={FWD.std():.3f} (命令 {args.vx}) 跟踪比 {FWD.mean()/max(args.vx,1e-6):.2f}")
 print(f"[机身] base height mean={BH.mean():.3f}  roll/pitch 角速度模 p95={torch.quantile(AXY.flatten(),0.95):.2f}")
-print(f"\n[追踪残差] leg Σ(q-q̂)² mean={RESID.mean():.4f}  (对应 leg_joint_pos 奖励 = {-15*RESID.mean():.3f})")
+print(f"\n[追踪残差] leg Σ(q-q̂)² mean={RESID.mean():.4f}")
 print(f"           每关节 RMS = {(RESID.mean()/10).sqrt():.4f} rad = {(RESID.mean()/10).sqrt()*57.3:.2f} deg")
 print(f"[接触匹配] Σ I[c=ĉ] mean={CM.mean():.3f} (满分 2)")
 print("\n[path-frame xy]")

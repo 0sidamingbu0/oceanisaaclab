@@ -393,8 +393,10 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             self._soft_neck_joint_pos_limits[:, :, 1],
         )
         self._substep = 0
-        # 相位积分：φ̇ 按命令插值（零命令参考为常量站立帧，相位照走与论文一致）
+        # 相位积分：φ̇ 按命令插值，零速时冻结。站立参考与脖子参考
+        # 都是静态的，不再向策略输入持续变化的步态时钟。
         phase_rate = self._reference_gait.sample_phase_rate(self._commands)
+        phase_rate = phase_rate * self._moving_mask().float()
         self._phase = torch.remainder(self._phase + phase_rate * self.step_dt, 1.0)
         # 表 V 扰动进程
         self._update_paper_disturbances()
@@ -488,15 +490,29 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         vy[torch.abs(vy) < self.cfg.move_command_threshold] = 0.0
         vy[turn_in_place] = 0.0
         wz = self._sample_range(self.cfg.command_wz_range, (n,))
+        wz[torch.abs(wz) < self.cfg.move_command_threshold] = 0.0
 
         self._commands[env_ids, 0] = vx
         self._commands[env_ids[moving_or_turning], 1] = vy[moving_or_turning]
         self._commands[env_ids[moving_or_turning], 2] = wz[moving_or_turning]
         self._is_standing[env_ids] = standing
-        self._head_commands[env_ids, 0] = self._sample_range(self.cfg.head_command_dh_range, (n,))
-        self._head_commands[env_ids, 1] = self._sample_range(self.cfg.head_command_pitch_range, (n,))
-        self._head_commands[env_ids, 2] = self._sample_range(self.cfg.head_command_yaw_range, (n,))
-        self._head_commands[env_ids, 3] = self._sample_range(self.cfg.head_command_roll_range, (n,))
+        # The 10-DOF fixed-neck baseline learns this gait, while introducing full random
+        # head commands from step zero repeatedly collapses to permanent double support.
+        # Use the same short smooth bootstrap as the existing reward weights, with no
+        # discrete stage transition: 0 head range at start, full range after 500 iters.
+        head_command_scale = 1.0 - self._reward_curriculum_blend()
+        self._head_commands[env_ids, 0] = head_command_scale * self._sample_range(
+            self.cfg.head_command_dh_range, (n,)
+        )
+        self._head_commands[env_ids, 1] = head_command_scale * self._sample_range(
+            self.cfg.head_command_pitch_range, (n,)
+        )
+        self._head_commands[env_ids, 2] = head_command_scale * self._sample_range(
+            self.cfg.head_command_yaw_range, (n,)
+        )
+        self._head_commands[env_ids, 3] = head_command_scale * self._sample_range(
+            self.cfg.head_command_roll_range, (n,)
+        )
         self._control_resample_left[env_ids] = self._sample_range(
             self.cfg.control_resample_interval_s, (n,)
         )
@@ -638,9 +654,38 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
     # ------------------------------------------------------------------
     # rewards: paper Table I (leg subset), weights × step_dt
     # ------------------------------------------------------------------
+    def _reward_curriculum_blend(self) -> float:
+        """Return 1 at bootstrap start and cosine-anneal to 0 at normal weights."""
+        if not self.cfg.enable_contact_match_curriculum:
+            return 0.0
+        elapsed_steps = self.cfg.contact_match_curriculum_step_offset + self.common_step_counter
+        progress = min(1.0, elapsed_steps / float(self.cfg.contact_match_anneal_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    def _current_gait_reward_weights(self) -> tuple[float, float, float, float]:
+        """Schedule existing gait terms without introducing a separate bootstrap reward."""
+        cfg = self.cfg
+        blend = self._reward_curriculum_blend()
+
+        def anneal(initial: float, normal: float) -> float:
+            return normal + (initial - normal) * blend
+
+        return (
+            anneal(cfg.rew_w_contact_match_initial, cfg.rew_w_contact_match),
+            anneal(cfg.rew_w_leg_joint_pos_initial, cfg.rew_w_leg_joint_pos),
+            anneal(cfg.rew_w_action_rate_initial, cfg.rew_w_action_rate),
+            anneal(cfg.rew_w_action_acc_initial, cfg.rew_w_action_acc),
+        )
+
+    def _current_contact_match_weight(self) -> float:
+        return self._current_gait_reward_weights()[0]
+
     def _get_rewards(self) -> torch.Tensor:
         cfg = self.cfg
         ref = self._reference_gait.sample(self._commands, self._phase)
+        contact_weight, leg_joint_pos_weight, action_rate_weight, action_acc_weight = (
+            self._current_gait_reward_weights()
+        )
 
         base_xy = self.robot.data.root_pos_w.torch[:, :2]
         head_yaw = self._head_yaw()
@@ -677,11 +722,14 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         ang_err_z = torch.square(ang_vel[:, 2] - ref["ang_vel_b"][:, 2])
         rew_ang_z = cfg.rew_w_ang_vel_z * torch.exp(-cfg.rew_k_ang_vel * ang_err_z)
         # 5) 腿关节角 / 角速度（负 L2，论文原样）
-        rew_joint_pos = cfg.rew_w_leg_joint_pos * torch.sum(torch.square(joint_pos - ref["joint_pos"]), dim=1)
+        rew_joint_pos = leg_joint_pos_weight * torch.sum(torch.square(joint_pos - ref["joint_pos"]), dim=1)
         rew_joint_vel = cfg.rew_w_leg_joint_vel * torch.sum(torch.square(joint_vel - ref["joint_vel"]), dim=1)
-        # 6) 接触匹配：Σᵢ I[cᵢ = ĉᵢ]
+        # 6) 接触模仿：去掉动作无关的正基线，只惩罚与参考不一致的脚。
+        #    零速 ref=[1,1] 仍要求双脚支撑；行走摆动相持续着地则明确扣分。
         ref_contact = (ref["feet_contact"] >= 0.5).float()
-        rew_contact = cfg.rew_w_contact_match * torch.sum((in_contact == ref_contact).float(), dim=1)
+        rew_contact = -contact_weight * torch.sum(
+            (in_contact != ref_contact).float(), dim=1
+        )
         # 7) 正则：力矩 / 关节加速度 / 动作率 / 动作加速度
         neck_torque = self.robot.data.applied_torque.torch[:, self._neck_dof_idx]
         rew_torque = cfg.rew_w_torque * (
@@ -692,11 +740,11 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             torch.sum(torch.square(joint_acc), dim=1)
             + torch.sum(torch.square(neck_joint_acc), dim=1)
         )
-        rew_action_rate = cfg.rew_w_action_rate * torch.sum(
+        rew_action_rate = action_rate_weight * torch.sum(
             torch.square(self._actions[:, self._leg_action_slice]
                          - self._previous_actions[:, self._leg_action_slice]), dim=1
         )
-        rew_action_acc = cfg.rew_w_action_acc * torch.sum(
+        rew_action_acc = action_acc_weight * torch.sum(
             torch.square(self._actions[:, self._leg_action_slice]
                          - 2.0 * self._previous_actions[:, self._leg_action_slice]
                          + self._prev_prev_actions[:, self._leg_action_slice]), dim=1
@@ -775,6 +823,14 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         log["Metrics/left_contact_rate"] = torch.mean(self._metric_left_contact[env_ids] / metric_steps)
         log["Metrics/right_contact_rate"] = torch.mean(self._metric_right_contact[env_ids] / metric_steps)
         log["Metrics/double_support_rate"] = torch.mean(self._metric_double_support[env_ids] / metric_steps)
+        contact_weight, leg_joint_pos_weight, action_rate_weight, action_acc_weight = (
+            self._current_gait_reward_weights()
+        )
+        log["Curriculum/contact_match_weight"] = contact_weight
+        log["Curriculum/leg_joint_pos_weight"] = leg_joint_pos_weight
+        log["Curriculum/action_rate_weight"] = action_rate_weight
+        log["Curriculum/action_acc_weight"] = action_acc_weight
+        log["Curriculum/head_command_scale"] = 1.0 - self._reward_curriculum_blend()
         saturation = self._metric_action_saturation[env_ids] / metric_steps.unsqueeze(1)
         for action_id, name in enumerate(self.cfg.leg_joint_names + self.cfg.neck_joint_names):
             log[f"Metrics/action_saturation/{name}"] = torch.mean(saturation[:, action_id])

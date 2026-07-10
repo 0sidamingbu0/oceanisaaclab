@@ -77,16 +77,26 @@ cmd = torch.tensor([args.vx, args.vy, args.wz], device=dev, dtype=torch.float32)
 env.reset()
 env._commands[:] = cmd
 feet = env._feet_body_ids
-feet_c = env._feet_contact_ids
 default_leg = env._default_leg_joint_pos  # (N,10)，腿部 default 恒 0
+default_neck = env._default_neck_joint_pos
+neck_ranges = env._neck_joint_ranges
+env._head_commands.zero_()
+
+
+def reference_action(ref):
+    action = torch.zeros(env.num_envs, cfg.action_space, device=dev)
+    action[:, env._leg_action_slice] = (ref["joint_pos"] - default_leg) / joint_ranges
+    action[:, env._neck_action_slice] = (ref["neck_pos"] - default_neck) / neck_ranges
+    return action.clamp(-1.0, 1.0)
 
 # RSI 探针：reset 之后、任何 step 之前，直接读姿态，隔离「RSI 写入是否就已倾倒」
 pg0 = env.robot.data.projected_gravity_b.torch
 h0 = env.robot.data.root_pos_w.torch[:, 2] - env.scene.env_origins[:, 2]
 tilt0 = (-pg0[:, 2] < cfg.walk_min_upright_projection)
 print("\n[RSI探针] reset 后未 step：not_upright(倾>49°) env={}/{}  "
-      "base_h mean={:.3f}  -proj_g_z min={:.3f} (阈值0.65)".format(
-          int(tilt0.sum()), args.num_envs, float(h0.mean()), float((-pg0[:, 2]).min())))
+      "base_h mean={:.3f}  -proj_g_z min={:.3f} (阈值{:.2f})".format(
+          int(tilt0.sum()), args.num_envs, float(h0.mean()), float((-pg0[:, 2]).min()),
+          cfg.walk_min_upright_projection))
 
 N = args.num_envs
 # 每个 env 只统计其「首次摔倒之前」的一段生命（避免摔倒后乱翻的脚/姿态污染指标）。
@@ -100,11 +110,12 @@ contact_match, foot_h_swing = [], []
 for t in range(args.steps):
     with torch.inference_mode():
         env._commands[:] = cmd
+        env._head_commands.zero_()
         phase = env._gait_phase()
         ref = env._reference_gait.sample(env._commands, phase)
-        action = (ref["joint_pos"] - default_leg) / joint_ranges
-        env.step(action)
+        env.step(reference_action(ref))
         env._commands[:] = cmd
+        env._head_commands.zero_()
     if viz_on:
         time.sleep(float(env.step_dt))  # 实时节奏，便于肉眼观察
 
@@ -116,7 +127,8 @@ for t in range(args.steps):
         jp = env.robot.data.joint_pos.torch[:, env._leg_dof_idx]
         lo = env.robot.data.soft_joint_pos_limits.torch[:, env._leg_dof_idx, 0]
         hi = env.robot.data.soft_joint_pos_limits.torch[:, env._leg_dof_idx, 1]
-        c_low = (rp[:, 2] < cfg.min_base_height)
+        base_height = rp[:, 2] - env.scene.env_origins[:, 2]
+        c_low = base_height < cfg.walk_min_base_height
         c_tilt = (-pg[:, 2] < cfg.walk_min_upright_projection)
         c_joint = torch.any((jp < lo) | (jp > hi), dim=1)
         term_cause.append((t, int(c_low.sum()), int(c_tilt.sum()), int(c_joint.sum()), int(term.sum())))
@@ -138,8 +150,9 @@ for t in range(args.steps):
     ang_xy.append(masked(torch.norm(env.robot.data.root_ang_vel_b.torch[:, :2], dim=1)))
 
     ref_now = env._reference_gait.sample(env._commands, env._gait_phase())
-    in_c = (env.contact_sensor.data.current_contact_time.torch[:, feet_c] > 0.0).float()
-    contact_match.append(masked(1.0 - torch.mean(torch.abs(in_c - ref_now["feet_contact"]), dim=1)))
+    in_c = (env._feet_current_contact_time() > 0.0).float()
+    ref_contact = (ref_now["feet_contact"] >= 0.5).float()
+    contact_match.append(masked(1.0 - torch.mean(torch.abs(in_c - ref_contact), dim=1)))
 
     fh = (
         env.robot.data.body_pos_w.torch[:, feet, 2]
@@ -221,9 +234,11 @@ if viz_on:
         while simulation_app.is_running():
             with torch.inference_mode():
                 env._commands[:] = cmd
+                env._head_commands.zero_()
                 ref = env._reference_gait.sample(env._commands, env._gait_phase())
-                env.step((ref["joint_pos"] - default_leg) / joint_ranges)
+                env.step(reference_action(ref))
                 env._commands[:] = cmd
+                env._head_commands.zero_()
             time.sleep(float(env.step_dt))
     except KeyboardInterrupt:
         print("\n[viz] stopped.")

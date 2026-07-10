@@ -358,12 +358,13 @@ def generate_command_gait(
         base_pos_pf[:, 1] = FORWARD_VX_SIGN * params.lateral_sway * np.sin(2.0 * np.pi * phases)
     # path 系躯干偏航（相对 path frame 朝向的 yaw 振荡）：本步态不建模 → 0
     base_yaw_pf = np.zeros(n_phase)
-    # Nominal expressive head motion from the periodic reference. User head
-    # commands are added as offsets at runtime, matching paper Eq. (6).
+    # Nominal expressive head motion from the periodic reference. One full gait cycle
+    # contains two steps, so use the second harmonic for one neck bob per footstep.
+    # User head commands are added as offsets at runtime, matching paper Eq. (6).
     neck_pos = np.zeros((n_phase, 4))
     if not standing:
-        wave = np.sin(2.0 * np.pi * phases)
-        wave_quadrature = np.cos(2.0 * np.pi * phases)
+        wave = np.sin(4.0 * np.pi * phases)
+        wave_quadrature = np.cos(4.0 * np.pi * phases)
         neck_pos[:, 0] = 0.035 * wave_quadrature
         neck_pos[:, 1] = -0.035 * wave_quadrature
         neck_pos[:, 2] = 0.045 * wave
@@ -382,7 +383,7 @@ def generate_command_gait(
         "base_yaw_pf": base_yaw_pf,
         "base_height": base_height,
         "base_pitch": -lean,  # R_wb = Ry(base_pitch)
-        "phase_rate": 1.0 / cmd_period,
+        "phase_rate": 0.0 if standing else 1.0 / cmd_period,
         "neck_pos": neck_pos,
         "neck_vel": neck_vel,
         "max_pos_err": max_pos_err,

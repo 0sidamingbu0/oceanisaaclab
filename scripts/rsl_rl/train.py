@@ -58,6 +58,20 @@ with contextlib.suppress(ImportError):
 
 RSL_RL_VERSION = "5.0.1"
 
+
+def _restore_env_curriculum_progress(env_cfg, agent_cfg, checkpoint_path: str) -> None:
+    """Restore environment-only curriculum progress that RSL-RL does not checkpoint."""
+    if not getattr(env_cfg, "enable_contact_match_curriculum", False):
+        return
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    completed_iterations = int(checkpoint.get("iter", 0))
+    env_cfg.contact_match_curriculum_step_offset = completed_iterations * agent_cfg.num_steps_per_env
+    print(
+        "[INFO]: Restored contact-match curriculum at "
+        f"{env_cfg.contact_match_curriculum_step_offset} control steps "
+        f"from checkpoint iteration {completed_iterations}."
+    )
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
@@ -196,6 +210,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # set the log directory for the environment (works for all environment types)
         env_cfg.log_dir = log_dir
 
+        # Resolve the checkpoint before constructing the environment so environment-only
+        # curricula continue from the saved policy iteration instead of restarting at zero.
+        if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+            _restore_env_curriculum_progress(env_cfg, agent_cfg, resume_path)
+
         # create isaac environment
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
@@ -204,10 +224,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             from isaaclab.envs import multi_agent_to_single_agent
 
             env = multi_agent_to_single_agent(env)
-
-        # save resume path before creating a new log_dir
-        if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
         # wrap for video recording
         if args_cli.video:

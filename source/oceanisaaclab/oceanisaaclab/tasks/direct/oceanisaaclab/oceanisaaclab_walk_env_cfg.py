@@ -168,14 +168,15 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     actuator_armature_rand = 0.2  # 反射惯量 ±20%（论文附录 B 末段）
 
     # ------------------------------------------------------------------
-    # 奖励（论文表 I 腿部子集；neck 项删除）。权重按 legged_gym 约定乘 step_dt(0.02)。
+    # 奖励（论文表 I 的腿部与 neck 项 + 硬件适配启动课程）。
+    # 权重按 legged_gym 约定乘 step_dt(0.02)。
     # ------------------------------------------------------------------
     rew_w_torso_pos_xy = 1.0  # exp(-k·‖p_pf - p̂_pf‖²)
-    # 07-08 回归论文表I原值 200（强前进模仿，核心）。历史：无脖子阶段曾放平到 30 破站立盆地
-    # （k=200 时 anchor 到 0.25m 钳位处 exp≈0，前进梯度稀疏，见 memory ocean-walk-phase-0701-diverged）。
-    # 但加脖子后 neck=100 + head 扰动压垮弱信号 k=30 → 退回站立（memory ocean-neck-walk-gait-regression）；
-    # 论文靠 k=200 强模仿信号才扛得住 neck=100。配 rsi=0.8 缓解初期梯度稀疏，重训验证。
-    rew_k_torso_pos_xy = 200.0
+    # Hardware-adapted static reward balance. At the 0.25m path-frame clamp, the paper
+    # k=200 kernel is effectively zero and provides no recovery gradient to a stationary
+    # policy. k=30 keeps exp(-30*0.25^2)=0.153, so moving environments can still discover
+    # the reference trajectory without a time-varying bootstrap reward.
+    rew_k_torso_pos_xy = 30.0
     rew_w_torso_orient = 1.0  # exp(-20·‖θ ⊟ θ̂‖²)
     rew_k_torso_orient = 20.0
     rew_w_lin_vel_xy = 1.0  # exp(-8·‖v_xy - v̂_xy‖²)
@@ -184,27 +185,40 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     rew_w_ang_vel_xy = 0.5  # exp(-2·‖ω_xy - ω̂_xy‖²)
     rew_k_ang_vel = 2.0
     rew_w_ang_vel_z = 0.5
-    # 07-08 回归论文表I原值 -15（历史为破站立盆地加大到 -25 逼摆腿；论文路线靠强 torso 位置
-    # 模仿而非加大 leg 逼迈步，回退到论文值）。
-    rew_w_leg_joint_pos = -15.0  # -‖q - q̂‖²（负 L2，非 exp 核）
+    # Keep the proven no-neck tracking weight. Stronger early tracking made the policy
+    # chase an open-loop reference that only survives about 0.7 s instead of learning
+    # stabilizing corrections around it.
+    rew_w_leg_joint_pos = -25.0  # -‖q - q̂‖²（负 L2，非 exp 核）
+    rew_w_leg_joint_pos_initial = -25.0
     rew_w_leg_joint_vel = -1.0e-3
-    # 07-08 回归论文表I原值 1.0（历史加大到 1.5 垫低站立盆地，论文路线回退）。
-    rew_w_contact_match = 1.0  # Σᵢ I[cᵢ = ĉᵢ]，每脚一致 +1
+    # Contact imitation is implemented as -Σ I[c_i != c_ref_i]. This is the same existing
+    # contact term with its action-independent positive baseline removed: correct contact
+    # gets 0, while a foot that stays planted during reference swing is explicitly costly.
+    rew_w_contact_match = 1.5
+    # Over the first 500 flat-training iterations, restore normal action smoothness and
+    # contact weights while expanding head commands from zero to their full range.
+    enable_contact_match_curriculum = True
+    rew_w_contact_match_initial = 3.0
+    contact_match_anneal_steps = 12_000
+    # Filled automatically by the training entry point when resuming a checkpoint.
+    contact_match_curriculum_step_offset = 0
     rew_w_torque = -1.0e-3
     rew_w_joint_acc = -2.5e-6
     rew_w_action_rate = -1.5  # 腿动作率（论文表 I：leg action rate 1.5）
+    rew_w_action_rate_initial = -0.5
     rew_w_action_acc = -0.45  # 腿动作加速度（论文：leg action acc 0.45）
-    # 脖子/头部模仿（论文表 I neck 项，脖子启用后恢复）：
-    # 脖子关节角模仿参考头姿（NeckHeadMap(head_cmd)），论文权重 100；脖子位置驱动、
-    # 轻质、与腿解耦，追踪容易，大权重不干扰腿。脖子关节速度惩罚使头姿稳定不抖。
-    rew_w_neck_joint_pos = -100.0  # -‖q_neck - q̂_neck‖²（论文 neck joint positions 100）
-    rew_w_neck_joint_vel = -1.0  # -‖q̇_neck‖²（论文 neck joint velocities 1.0；参考头姿静止）
-    rew_w_neck_action_rate = -5.0  # 论文 neck action rate 5.0
-    rew_w_neck_action_acc = -5.0  # 论文 neck action acc 5.0
-    # 07-08 回归论文表I原值 20。历史降到 2 是因为 k=30 弱模仿信号下 survival 主导总回报、
-    # 逼出站立盆地；现在 torso_pos_xy 回 k=200 强信号，论文范式里 survival=20 与强模仿共存
-    # （前进是精确模仿副产物，不靠低 survival 逼迈步）。见 memory ocean-walk-standing-local-optimum。
-    rew_w_survival = 20.0
+    rew_w_action_acc_initial = -0.15
+    # The paper's neck weights dominate this four-joint position-servo adaptation: the
+    # observed neck term reached -10.8 while the complete leg-position term was -1.57.
+    # Keep head tracking active, but normalize it to the same scale as locomotion.
+    rew_w_neck_joint_pos = -25.0
+    rew_w_neck_joint_vel = -0.25
+    rew_w_neck_action_rate = -1.5
+    rew_w_neck_action_acc = -0.45
+    # Survival=20 made standing nearly risk-free and dominated the missing 0.8 contact
+    # matches. The proven static anti-basin value preserves a fall cost without rewarding
+    # permanent double support more than gait imitation.
+    rew_w_survival = 2.0
 
     # ------------------------------------------------------------------
     # 终止（论文 V-B）：躯干或头部触地。当前 nested URDF 的 PhysX contact
@@ -325,3 +339,5 @@ class OceanisaaclabWalkRoughEnvCfg(OceanisaaclabWalkEnvCfg):
     )
     # Rough runner uses 96 control steps per iteration.
     disturbance_curriculum_steps = 144_000
+    # Rough terrain is a fine-tuning stage entered after the flat walking curriculum.
+    enable_contact_match_curriculum = False
