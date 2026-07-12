@@ -6,20 +6,20 @@
 """路线 B（BDX 论文适配复刻）训练环境配置。
 
 对照迪士尼论文《Design and Control of a Bipedal Robotic Character》(RSS 2024,
-工程根目录 BD_X_paper.pdf) 的 periodic walking policy 复刻，固定脖子、只训 10 个
-腿部电机：
+工程根目录 BD_X_paper.pdf) 的 periodic walking policy 复刻，学习控制 10 个腿部和
+4 个脖子电机：
 
-- 观测 = 论文公式 (8) 状态 s_t + 相位二阶谐波特征 + 命令 g_peri（式 (6) 去掉头部命令）：
+- 观测 = 论文公式 (8) 状态 s_t + 相位二阶谐波特征 + 完整命令 g_peri：
   path 系躯干 xy(2) + path 系 yaw sin/cos(2) + body 系线速度(3) + body 系角速度(3)
-  + q(10) + q̇(10) + a_{t-1}(10) + a_{t-2}(10) + phase 谐波(4) + cmd(3) = 57 维。
-- 非对称 critic（附录 A）：critic 额外收无噪声观测 + 摩擦/质量随机化系数 = 59 维。
-- 奖励 = 论文表 I 腿部子集（neck 项因固定脖子删除），权重×step_dt（legged_gym 约定）。
+  + 腿/脖子 q、q̇ + 14 维前两步动作 + phase 谐波(4) + cmd(3) + head cmd(4) = 80 维。
+- 非对称 critic（附录 A）：critic 额外收无噪声观测 + 摩擦/质量随机化系数 = 82 维。
+- 奖励 = 论文表 I 的腿部与 neck 项，权重×step_dt（legged_gym 约定）。
 - path frame（V-A 节 / Fig.4）：行走按命令积分、站立收敛双脚中心、最大偏差投影。
 - 动作管线（V-C/V-D 节）：50Hz 策略 → 逐关节线性映射（0=标称站姿）→ 围绕实测关节角
   限幅（δ=τmax/kP）→ 一阶保持插值 + 37.5Hz 低通 → 200Hz 附录 B 执行器模型
   （软件 PD + 编码器偏移 + 摩擦 + 速度相关力矩限幅 + 背隙/噪声编码器读数 + 反射惯量）。
-- 扰动 = 论文表 V 三档独立进程（幅度按整机质量 ≈10kg/15.4kg 缩放），前 1500 iter
-  线性课程。
+- 扰动 = 论文表 V 三档独立进程（幅度按整机质量 ≈10kg/15.4kg 缩放），基础步态
+  等待阶段后线性放开。
 """
 
 import isaaclab.sim as sim_utils
@@ -115,6 +115,9 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     gait_library_path = str(OCEAN_ASSET_DIR / "gaits" / "reference_gait.npz")
     # URDF 全零姿态（BDX 标准屈膝站立）FK 站立高度，不再压低
     target_base_height = 0.385
+    # Full-speed torso lean reduced from 5 to 3 degrees. The learned gait already tracks
+    # vx=0.15 accurately; the larger reference lean reduces the sim2sim forward-fall margin.
+    walk_lean_angle = 0.052
 
     # ------------------------------------------------------------------
     # 脖子/头部（论文 g_peri 的头部命令 Δh_head, Δθ_head；本机脖子 4 关节实现
@@ -125,16 +128,18 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     # 脖子动作线性映射范围（0=默认位，±1→±range）；覆盖映射表参考角跨度，clamp 兜软限位。
     # 顺序 [n1, n2, n3, n4] = [矢状 pitch/高度对 ×2, yaw, roll]
     neck_action_joint_ranges = (0.8, 0.8, 1.2, 0.7)  # [rad]
-    # 头部命令采样范围（与 neck_head_map 网格一致）。每 env reset 均匀采样，整段 episode 恒定。
-    head_command_dh_range = (-0.02, 0.02)  # [m] 头高偏移（本机脖子高度权限弱，压到 ±2cm）
-    head_command_pitch_range = (-0.5, 0.5)  # [rad] 点头
-    head_command_yaw_range = (-1.0, 1.0)  # [rad] 摇头
-    head_command_roll_range = (-0.6, 0.6)  # [rad] 歪头
+    # model_1400 remains stable while the old curriculum is at 20%, but neck tracking loss
+    # grows rapidly as the four simultaneous commands approach their old limits. Keep the
+    # paper's 4-DOF command interface and map, with a hardware-adapted range near one third.
+    head_command_dh_range = (-0.007, 0.007)  # [m] 头高偏移
+    head_command_pitch_range = (-0.17, 0.17)  # [rad] 点头
+    head_command_yaw_range = (-0.33, 0.33)  # [rad] 摇头
+    head_command_roll_range = (-0.20, 0.20)  # [rad] 歪头
     # 头命令 obs 缩放（dh 量级小，放大到与其它命令可比；obs_normalization 亦会归一）
     head_command_scale = (20.0, 1.0, 1.0, 1.0)
-    # 论文要求控制输入从训练开始就在完整范围随机化。episode 内定期换目标，覆盖部署时
-    # joystick 阶跃与策略切换，而不是只在 8 秒 episode 开头采一次常值。
-    control_resample_interval_s = (1.5, 3.5)
+    # Keep command transitions in training, but allow the 1rad/s neck servos to settle before
+    # another independent four-axis target is sampled.
+    control_resample_interval_s = (4.0, 8.0)
 
     # ------------------------------------------------------------------
     # path frame（论文 V-A / Fig.4）
@@ -194,13 +199,17 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     # Contact imitation is implemented as -Σ I[c_i != c_ref_i]. This is the same existing
     # contact term with its action-independent positive baseline removed: correct contact
     # gets 0, while a foot that stays planted during reference swing is explicitly costly.
-    rew_w_contact_match = 1.5
-    # Over the first 500 flat-training iterations, restore normal action smoothness and
-    # contact weights while expanding head commands from zero to their full range.
+    # A weight of 3 forced model_22100 to follow the swing schedule before it could balance:
+    # every episode still fell after about one second. Keep explicit contact imitation, but
+    # leave enough reward margin for stabilizing corrections around the reference motion.
+    rew_w_contact_match = 2.0
+    # Restore normal action smoothness over roughly the first 1000 flat-training iterations.
+    # Head commands have an independent curriculum below so they cannot destabilize this stage.
     enable_contact_match_curriculum = True
-    rew_w_contact_match_initial = 3.0
-    contact_match_anneal_steps = 12_000
-    # Filled automatically by the training entry point when resuming a checkpoint.
+    rew_w_contact_match_initial = 2.0
+    contact_match_anneal_steps = 24_000
+    # Filled automatically by the training entry point when resuming a checkpoint. Despite
+    # the legacy name, this offset is shared by reward, head-command and disturbance curricula.
     contact_match_curriculum_step_offset = 0
     rew_w_torque = -1.0e-3
     rew_w_joint_acc = -2.5e-6
@@ -208,17 +217,21 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     rew_w_action_rate_initial = -0.5
     rew_w_action_acc = -0.45  # 腿动作加速度（论文：leg action acc 0.45）
     rew_w_action_acc_initial = -0.15
-    # The paper's neck weights dominate this four-joint position-servo adaptation: the
-    # observed neck term reached -10.8 while the complete leg-position term was -1.57.
-    # Keep head tracking active, but normalize it to the same scale as locomotion.
-    rew_w_neck_joint_pos = -25.0
-    rew_w_neck_joint_vel = -0.25
-    rew_w_neck_action_rate = -1.5
-    rew_w_neck_action_acc = -0.45
-    # Survival=20 made standing nearly risk-free and dominated the missing 0.8 contact
-    # matches. The proven static anti-basin value preserves a fall cost without rewarding
-    # permanent double support more than gait imitation.
-    rew_w_survival = 2.0
+    # Paper Table I values. The previous reduced weights allowed zero-command n3/n4
+    # motion around 0.04-0.05rad RMS instead of tracking their zero reference.
+    rew_w_neck_joint_pos = -100.0
+    rew_w_neck_joint_vel = -1.0
+    rew_w_neck_action_rate = -5.0
+    rew_w_neck_action_acc = -5.0
+    # Survival=2 did not outweigh aggressive reference/contact tracking: model_22100 had a
+    # 100% fall rate for the entire run. Five restores a useful fall cost without returning
+    # to the old value of 20 that encouraged permanent double support.
+    rew_w_survival = 5.0
+
+    # Learn the leg gait first. Keep head targets at zero for about 1000 iterations, then
+    # smoothly expose the hardware-adapted head-command range over the following 2000 iterations.
+    head_command_curriculum_delay_steps = 24_000
+    head_command_curriculum_ramp_steps = 48_000
 
     # ------------------------------------------------------------------
     # 终止（论文 V-B）：躯干或头部触地。当前 nested URDF 的 PhysX contact
@@ -240,11 +253,12 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
 
     # ------------------------------------------------------------------
     # 表 V 三档扰动（每 body 独立进程）。力/矩幅值已按整机质量 ≈10kg / 论文 15.4kg
-    # （×0.65）缩放；短/小与长/小档幅值小，不缩放。前 1500 iter 线性课程
-    # （1500 iter × 24 steps = 36_000 common steps）。
+    # （×0.65）缩放；短/小与长/小档幅值小，不缩放。头命令课程完成后，再用约
+    # 3000 iter 线性放开完整论文扰动，避免两种非平稳训练分布同时增强。
     # ------------------------------------------------------------------
     enable_paper_disturbance = True
-    disturbance_curriculum_steps = 36_000
+    disturbance_curriculum_delay_steps = 72_000
+    disturbance_curriculum_steps = 72_000
     # 短/小：髋 + 脚
     dist_small_short_bodies = ("leg_r2_link", "leg_l2_link", "leg_r5_link", "leg_l5_link")
     dist_small_short_force_xy = (0.0, 5.0)  # [N]
@@ -337,7 +351,8 @@ class OceanisaaclabWalkRoughEnvCfg(OceanisaaclabWalkEnvCfg):
         ),
         debug_vis=False,
     )
-    # Rough runner uses 96 control steps per iteration.
-    disturbance_curriculum_steps = 144_000
+    # Rough runner uses 96 control steps per iteration; preserve the same iteration schedule.
+    disturbance_curriculum_delay_steps = 288_000
+    disturbance_curriculum_steps = 288_000
     # Rough terrain is a fine-tuning stage entered after the flat walking curriculum.
     enable_contact_match_curriculum = False

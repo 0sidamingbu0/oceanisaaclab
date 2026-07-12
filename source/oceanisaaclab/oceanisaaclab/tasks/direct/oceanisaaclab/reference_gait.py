@@ -47,6 +47,9 @@ class ReferenceGait:
         self.base_pitch = tensor("base_pitch")
         self.gait_period = float(data["gait_period"])
         self.gait_duty = float(data["gait_duty"])
+        self.foot_clearance = (
+            float(data["foot_clearance"]) if "foot_clearance" in data.files else 0.0
+        )
         self.num_phase = self.joint_pos.shape[3]
         self.joint_names = [str(n) for n in data["joint_names"]]
         # --- BDX 论文完整目标状态 x_t 的新增字段（旧库回退到兼容默认值） ---

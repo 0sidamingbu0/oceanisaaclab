@@ -220,9 +220,9 @@ print("\n[接触] 实测/参考接触一致度 mean={:.3f}  (1.0=时序完全贴
     nanmean(CM)))
 swing_valid = FHS[~torch.isnan(FHS)]
 if swing_valid.numel() > 0:
-    print("[抬脚] 摆动脚脚底间隙 [m] mean={:.4f} p50={:.4f} p95={:.4f}  (对照库里 foot_clearance≈0.035)".format(
+    print("[抬脚] 摆动脚脚底间隙 [m] mean={:.4f} p50={:.4f} p95={:.4f}  (参考 foot_clearance={:.3f})".format(
         float(swing_valid.mean()), float(torch.quantile(swing_valid, 0.5)),
-        float(torch.quantile(swing_valid, 0.95))))
+        float(torch.quantile(swing_valid, 0.95)), env._reference_gait.foot_clearance))
 else:
     print("[抬脚] 无摆动脚样本（双脚几乎全程着地——零命令站立时正常）")
 print("============================================================================\n")

@@ -104,7 +104,7 @@ FHS = torch.stack(foot_h_swing)
 IC = torch.stack(in_contact_frac)
 RESID = torch.stack(leg_resid)
 foot_origin_offset = 0.067
-clearance = 0.035
+clearance = env._reference_gait.foot_clearance
 
 print("\n========== WALK BASELINE DIAGNOSTICS (no-neck, disturb/noise OFF) ==========")
 print(f"checkpoint: {args.checkpoint}")

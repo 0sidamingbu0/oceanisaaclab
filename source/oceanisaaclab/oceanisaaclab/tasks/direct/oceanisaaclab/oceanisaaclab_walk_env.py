@@ -5,15 +5,15 @@
 
 """路线 B（BDX 论文适配复刻）训练环境。
 
-对照迪士尼论文（工程根目录 BD_X_paper.pdf）的 periodic walking policy，固定脖子、
-只训 10 个腿部电机。相对基类（路线 A）替换了全部核心环节：
+对照迪士尼论文（工程根目录 BD_X_paper.pdf）的 periodic walking policy，学习控制
+10 个腿部和 4 个脖子电机。相对基类（路线 A）替换了全部核心环节：
 
 1. **path frame**（V-A 节）：行走按命令积分、站立收敛双脚中心、最大偏差投影；
    躯干 path 系位姿进观测与奖励（速度跟踪由 path 系位置模仿隐式实现）。
 2. **观测**（公式 (8) + 附录 A）：path 系躯干 xy/yaw + body 系线/角速度 + q/q̇ +
-   前两步动作 + 相位二阶谐波 + 命令，57 维；非对称 critic 额外收无噪声观测 +
-   摩擦/质量随机化系数（59 维）。
-3. **奖励**（表 I 腿部子集）：躯干位姿/速度 exp 核 + 腿关节负 L2 + 接触匹配 +
+   前两步动作 + 相位二阶谐波 + 行走/头部命令，80 维；非对称 critic 额外收
+   无噪声观测 + 摩擦/质量随机化系数（82 维）。
+3. **奖励**（表 I）：躯干位姿/速度 exp 核 + 腿/脖子关节模仿 + 接触匹配 +
    力矩/加速度/动作率/动作加速度正则 + 存活，权重×step_dt。
 4. **动作管线**（V-C/V-D + 附录 A）：逐关节线性映射（0=标称站姿）→ 围绕实测
    关节角 ±τmax/kP 限幅 → 一阶保持插值 + 37.5Hz 低通 → 200Hz 执行器模型。
@@ -21,7 +21,7 @@
    速度相关力矩限幅 + 背隙/速度相关噪声编码器读数 + 反射惯量随机化，全部
    每 episode 重采样。
 6. **扰动**（表 V）：三档独立进程（髋/脚短小扰动、盆骨长小扰动、盆骨短大推力），
-   前 1500 iter 线性课程。
+   基础步态等待阶段后线性放开。
 7. **相位**：φ̇ 从参考库按命令插值（步频随速度变化），逐步积分。
 """
 
@@ -289,6 +289,20 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         self._metric_right_contact = torch.zeros(self.num_envs, device=self.device)
         self._metric_double_support = torch.zeros(self.num_envs, device=self.device)
         self._metric_steps = torch.zeros(self.num_envs, device=self.device)
+        # Direction-conditioned diagnostics: [forward/backward, right/left]. Global
+        # contact averages hid the model_39200 backward and left-foot collapse.
+        self._metric_direction_contact = torch.zeros(self.num_envs, 2, 2, device=self.device)
+        self._metric_direction_steps = torch.zeros(self.num_envs, 2, device=self.device)
+        self._metric_direction_swing_clearance = torch.zeros(
+            self.num_envs, 2, 2, device=self.device
+        )
+        self._metric_direction_swing_samples = torch.zeros(
+            self.num_envs, 2, 2, device=self.device
+        )
+        self._metric_direction_vx = torch.zeros(self.num_envs, 2, device=self.device)
+        self._metric_direction_command_vx = torch.zeros(self.num_envs, 2, device=self.device)
+        self._metric_direction_vx_error = torch.zeros(self.num_envs, 2, device=self.device)
+        self._metric_neck_tracking_sq = torch.zeros(self.num_envs, device=self.device)
         self._metric_action_saturation = torch.zeros(
             self.num_envs, self.cfg.action_space, device=self.device
         )
@@ -445,7 +459,10 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
     def _update_paper_disturbances(self) -> None:
         if not self._disturbances:
             return
-        scale = min(1.0, self.common_step_counter / float(self.cfg.disturbance_curriculum_steps))
+        elapsed = max(
+            0, self._walk_curriculum_steps() - self.cfg.disturbance_curriculum_delay_steps
+        )
+        scale = min(1.0, elapsed / float(self.cfg.disturbance_curriculum_steps))
         for sched in self._disturbances:
             sched.step(self.step_dt, scale)
         self._dist_forces.zero_()
@@ -462,6 +479,15 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         if abs(hi - lo) < 1e-12:
             return torch.full(shape, lo, dtype=torch.float, device=self.device)
         return sample_uniform(lo, hi, shape, self.device)
+
+    def _head_command_curriculum_scale(self) -> float:
+        elapsed = max(
+            0, self._walk_curriculum_steps() - self.cfg.head_command_curriculum_delay_steps
+        )
+        return min(1.0, elapsed / float(self.cfg.head_command_curriculum_ramp_steps))
+
+    def _walk_curriculum_steps(self) -> int:
+        return self.cfg.contact_match_curriculum_step_offset + self.common_step_counter
 
     def _resample_controls(self, env_ids: torch.Tensor, initialize_phase: bool = False) -> None:
         """Sample the full paper control range, including within-episode transitions."""
@@ -496,11 +522,9 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         self._commands[env_ids[moving_or_turning], 1] = vy[moving_or_turning]
         self._commands[env_ids[moving_or_turning], 2] = wz[moving_or_turning]
         self._is_standing[env_ids] = standing
-        # The 10-DOF fixed-neck baseline learns this gait, while introducing full random
-        # head commands from step zero repeatedly collapses to permanent double support.
-        # Use the same short smooth bootstrap as the existing reward weights, with no
-        # discrete stage transition: 0 head range at start, full range after 500 iters.
-        head_command_scale = 1.0 - self._reward_curriculum_blend()
+        # Hold a neutral head while learning the base gait, then smoothly expose the full
+        # command range independently of the action-smoothness curriculum.
+        head_command_scale = self._head_command_curriculum_scale()
         self._head_commands[env_ids, 0] = head_command_scale * self._sample_range(
             self.cfg.head_command_dh_range, (n,)
         )
@@ -658,7 +682,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         """Return 1 at bootstrap start and cosine-anneal to 0 at normal weights."""
         if not self.cfg.enable_contact_match_curriculum:
             return 0.0
-        elapsed_steps = self.cfg.contact_match_curriculum_step_offset + self.common_step_counter
+        elapsed_steps = self._walk_curriculum_steps()
         progress = min(1.0, elapsed_steps / float(self.cfg.contact_match_anneal_steps))
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
@@ -798,6 +822,35 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         self._metric_right_contact += in_contact[:, 0]
         self._metric_double_support += torch.prod(in_contact, dim=1)
         self._metric_steps += 1.0
+        self._metric_neck_tracking_sq += torch.mean(
+            torch.square(neck_joint_pos - neck_ref), dim=1
+        )
+        foot_clearance = (
+            self.robot.data.body_pos_w.torch[:, self._feet_body_ids, 2]
+            - self.scene.env_origins[:, 2].unsqueeze(1)
+            - self.cfg.foot_origin_offset
+        )
+        ref_swing = 1.0 - ref_contact
+        direction_masks = (
+            self._commands[:, 0] > self.cfg.move_command_threshold,
+            self._commands[:, 0] < -self.cfg.move_command_threshold,
+        )
+        for direction_id, direction_mask in enumerate(direction_masks):
+            mask = direction_mask.float().unsqueeze(1)
+            self._metric_direction_contact[:, direction_id] += in_contact * mask
+            self._metric_direction_steps[:, direction_id] += direction_mask.float()
+            direction_weight = direction_mask.float()
+            physical_vx = self.cfg.forward_vx_sign * lin_vel[:, 0]
+            self._metric_direction_vx[:, direction_id] += physical_vx * direction_weight
+            self._metric_direction_command_vx[:, direction_id] += (
+                self._commands[:, 0] * direction_weight
+            )
+            self._metric_direction_vx_error[:, direction_id] += (
+                torch.abs(physical_vx - self._commands[:, 0]) * direction_weight
+            )
+            swing_mask = ref_swing * mask
+            self._metric_direction_swing_clearance[:, direction_id] += foot_clearance * swing_mask
+            self._metric_direction_swing_samples[:, direction_id] += swing_mask
         return total_reward
 
     # ------------------------------------------------------------------
@@ -823,6 +876,34 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         log["Metrics/left_contact_rate"] = torch.mean(self._metric_left_contact[env_ids] / metric_steps)
         log["Metrics/right_contact_rate"] = torch.mean(self._metric_right_contact[env_ids] / metric_steps)
         log["Metrics/double_support_rate"] = torch.mean(self._metric_double_support[env_ids] / metric_steps)
+        log["Metrics/neck_tracking_rms_rad"] = torch.sqrt(
+            torch.mean(self._metric_neck_tracking_sq[env_ids] / metric_steps)
+        )
+        for direction_id, direction_name in enumerate(("forward", "backward")):
+            direction_steps = self._metric_direction_steps[env_ids, direction_id].sum().clamp_min(1.0)
+            log[f"Metrics/{direction_name}_actual_vx"] = (
+                self._metric_direction_vx[env_ids, direction_id].sum() / direction_steps
+            )
+            log[f"Metrics/{direction_name}_command_vx"] = (
+                self._metric_direction_command_vx[env_ids, direction_id].sum() / direction_steps
+            )
+            log[f"Metrics/{direction_name}_vx_mae"] = (
+                self._metric_direction_vx_error[env_ids, direction_id].sum() / direction_steps
+            )
+            for foot_id, foot_name in enumerate(("right", "left")):
+                contact_sum = self._metric_direction_contact[env_ids, direction_id, foot_id].sum()
+                swing_samples = self._metric_direction_swing_samples[
+                    env_ids, direction_id, foot_id
+                ].sum().clamp_min(1.0)
+                clearance_sum = self._metric_direction_swing_clearance[
+                    env_ids, direction_id, foot_id
+                ].sum()
+                log[f"Metrics/{direction_name}_{foot_name}_contact_rate"] = (
+                    contact_sum / direction_steps
+                )
+                log[f"Metrics/{direction_name}_{foot_name}_ref_swing_clearance_cm"] = (
+                    100.0 * clearance_sum / swing_samples
+                )
         contact_weight, leg_joint_pos_weight, action_rate_weight, action_acc_weight = (
             self._current_gait_reward_weights()
         )
@@ -830,7 +911,13 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         log["Curriculum/leg_joint_pos_weight"] = leg_joint_pos_weight
         log["Curriculum/action_rate_weight"] = action_rate_weight
         log["Curriculum/action_acc_weight"] = action_acc_weight
-        log["Curriculum/head_command_scale"] = 1.0 - self._reward_curriculum_blend()
+        log["Curriculum/head_command_scale"] = self._head_command_curriculum_scale()
+        disturbance_elapsed = max(
+            0, self._walk_curriculum_steps() - self.cfg.disturbance_curriculum_delay_steps
+        )
+        log["Curriculum/disturbance_scale"] = min(
+            1.0, disturbance_elapsed / float(self.cfg.disturbance_curriculum_steps)
+        )
         saturation = self._metric_action_saturation[env_ids] / metric_steps.unsqueeze(1)
         for action_id, name in enumerate(self.cfg.leg_joint_names + self.cfg.neck_joint_names):
             log[f"Metrics/action_saturation/{name}"] = torch.mean(saturation[:, action_id])
@@ -840,9 +927,17 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             self._metric_left_contact,
             self._metric_right_contact,
             self._metric_double_support,
+            self._metric_neck_tracking_sq,
             self._metric_steps,
         ):
             metric[env_ids] = 0.0
+        self._metric_direction_contact[env_ids] = 0.0
+        self._metric_direction_steps[env_ids] = 0.0
+        self._metric_direction_swing_clearance[env_ids] = 0.0
+        self._metric_direction_swing_samples[env_ids] = 0.0
+        self._metric_direction_vx[env_ids] = 0.0
+        self._metric_direction_command_vx[env_ids] = 0.0
+        self._metric_direction_vx_error[env_ids] = 0.0
         self._metric_action_saturation[env_ids] = 0.0
 
         self._phase[env_ids] = torch.rand(n, device=self.device)

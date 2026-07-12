@@ -1,11 +1,11 @@
 """Headless 行走诊断（walk env / 14-DOF 带脖子版）：头命令强制=0，测策略是否真抬脚。
 
-针对 07-08 加脖子后 sim2sim 蹭脚问题：验证"追踪残差吃掉 3.5cm 抬脚余量"假设。
+针对 sim2sim 蹭脚问题：验证关节追踪残差是否吃掉参考抬脚余量，并区分左右脚。
 - 加载 Ocean-BDX-Walk-Direct-v0（80 维 obs，3×512 actor），手写 actor 前向避免 runner 版本问题；
 - 头命令 _head_commands 每步清零（复现 sim2sim 无头命令场景）；
 - 关扰动/噪声/延迟，测策略"想做什么"的纯步态意图；
 - 关键量：摆动脚原点离地高度分布 + 对参考步态的 leg 关节追踪残差 Σ(q-q̂)²
-  （= 训练 leg_joint_pos 奖励 /-15，可直接和 tensorboard 对照）。
+  （当前权重为 -25，可直接和 tensorboard 对照）。
 - path-frame 位置奖励分解：检查原地扭动/摆胯是否仍能吃到 torso_pos_xy 分。
 
 运行：./_isaaclab/isaaclab.sh -p scripts/diag_walk_neck.py --checkpoint <path> --vx 0.15
@@ -88,6 +88,8 @@ feet = env._feet_body_ids
 fwd, base_h, ang_xy = [], [], []
 foot_h_swing, in_contact_frac = [], []
 leg_resid, contact_match = [], []
+leg_resid_joint, tau_motor, tau_applied = [], [], []
+neck_pos_hist, neck_target_hist, neck_action_hist = [], [], []
 pos_pf_hist, ref_pf_hist, pos_err_hist, torso_pos_rew_hist, pf_world_dist_hist = [], [], [], [], []
 warmup = 60
 for t in range(args.steps):
@@ -115,7 +117,14 @@ for t in range(args.steps):
     # 对参考步态的 leg 关节追踪残差（= 训练 leg_joint_pos 奖励 /-15）
     ref = env._reference_gait.sample(env._commands, env._phase)
     q = env.robot.data.joint_pos.torch[:, env._leg_dof_idx]
-    leg_resid.append(((q - ref["joint_pos"]) ** 2).sum(dim=1))
+    joint_resid = (q - ref["joint_pos"]) ** 2
+    leg_resid.append(joint_resid.sum(dim=1))
+    leg_resid_joint.append(joint_resid)
+    tau_motor.append(env._last_tau_m.clone())
+    tau_applied.append(env._applied_leg_torque.clone())
+    neck_pos_hist.append(env.robot.data.joint_pos.torch[:, env._neck_dof_idx].clone())
+    neck_target_hist.append(env._neck_target.clone())
+    neck_action_hist.append(env._actions[:, env._neck_action_slice].clone())
     ref_contact = (ref["feet_contact"] >= 0.5).float()
     contact_match.append((in_c.float() == ref_contact).float().sum(dim=1))
     base_xy = env.robot.data.root_pos_w.torch[:, :2]
@@ -133,6 +142,12 @@ AXY = torch.stack(ang_xy)
 FHS = torch.stack(foot_h_swing)
 IC = torch.stack(in_contact_frac)
 RESID = torch.stack(leg_resid)
+RESID_JOINT = torch.stack(leg_resid_joint)
+TAU_MOTOR = torch.stack(tau_motor)
+TAU_APPLIED = torch.stack(tau_applied)
+NECK_POS = torch.stack(neck_pos_hist)
+NECK_TARGET = torch.stack(neck_target_hist)
+NECK_ACTION = torch.stack(neck_action_hist)
 CM = torch.stack(contact_match)
 POS_PF = torch.stack(pos_pf_hist)
 REF_PF = torch.stack(ref_pf_hist)
@@ -140,16 +155,27 @@ POS_ERR = torch.stack(pos_err_hist)
 TORSO_POS_REW = torch.stack(torso_pos_rew_hist)
 PF_WORLD_DIST = torch.stack(pf_world_dist_hist)
 foot_origin_offset = 0.067  # cfg 一致：leg5_link 原点到脚底
-clearance = 0.035  # 参考抬脚高度
+clearance = env._reference_gait.foot_clearance
 
 print("\n========== WALK+NECK DIAGNOSTICS (head_cmd=0, disturb/noise OFF) ==========")
 print(f"checkpoint: {args.checkpoint}")
 print(f"cmd vx={args.vx} vy={args.vy} wz={args.wz}  envs={args.num_envs}  steps={args.steps-warmup}")
-print(f"\n[跟踪] 前进 vx mean={FWD.mean():.3f} std={FWD.std():.3f} (命令 {args.vx}) 跟踪比 {FWD.mean()/max(args.vx,1e-6):.2f}")
+tracking_ratio = FWD.mean() / args.vx if abs(args.vx) > 1.0e-6 else torch.tensor(float("nan"), device=dev)
+print(f"\n[跟踪] 机体前向 vx mean={FWD.mean():.3f} std={FWD.std():.3f} (命令 {args.vx}) 跟踪比 {tracking_ratio:.2f}")
 print(f"[机身] base height mean={BH.mean():.3f}  roll/pitch 角速度模 p95={torch.quantile(AXY.flatten(),0.95):.2f}")
 print(f"\n[追踪残差] leg Σ(q-q̂)² mean={RESID.mean():.4f}")
 print(f"           每关节 RMS = {(RESID.mean()/10).sqrt():.4f} rad = {(RESID.mean()/10).sqrt()*57.3:.2f} deg")
 print(f"[接触匹配] Σ I[c=ĉ] mean={CM.mean():.3f} (满分 2)")
+joint_rms_deg = torch.sqrt(RESID_JOINT.mean(dim=(0, 1))) * 57.2958
+print(f"[逐腿关节 RMS] right={joint_rms_deg[:5].mean():.2f}deg left={joint_rms_deg[5:].mean():.2f}deg")
+tau_peak = torch.quantile(torch.abs(TAU_APPLIED).flatten(0, 1), 0.99, dim=0)
+tau_clip = (torch.abs(TAU_MOTOR - TAU_APPLIED) > 0.25).float().mean(dim=(0, 1))
+print(
+    "[电机力矩] applied |tau| p99 right={:.2f}Nm left={:.2f}Nm; "
+    "模型限幅/摩擦介入率 right={:.2%} left={:.2%}".format(
+        tau_peak[:5].mean(), tau_peak[5:].mean(), tau_clip[:5].mean(), tau_clip[5:].mean()
+    )
+)
 print("\n[path-frame xy]")
 print(
     f"pos_pf mean=({POS_PF[...,0].mean():+.4f}, {POS_PF[...,1].mean():+.4f}) "
@@ -174,16 +200,26 @@ print(
     f"(clamp {env.cfg.path_frame_max_pos_deviation:.2f}m)"
 )
 print(f"\n[脚高] 支撑相脚原点离地 ≈ {foot_origin_offset:.3f} m；参考摆动峰值应 ≈ {foot_origin_offset+clearance:.3f} m")
-sv = FHS[~torch.isnan(FHS)]
-if sv.numel() > 0:
-    swing_clear_p50 = torch.quantile(sv, 0.5) - foot_origin_offset
-    swing_clear_p95 = torch.quantile(sv, 0.95) - foot_origin_offset
-    print(f"[脚高] 摆动脚原点高度 p50={torch.quantile(sv,0.5):.4f} p95={torch.quantile(sv,0.95):.4f} max={sv.max():.4f}")
-    print(f"[抬脚] 实际离地间隙(原点-offset) p50={swing_clear_p50*100:.1f}cm p95={swing_clear_p95*100:.1f}cm  (参考 {clearance*100:.1f}cm)")
-    print(f"       判据: p50 离地 <1.5cm ≈ 蹭走；接近 {clearance*100:.1f}cm ≈ 抬脚到位")
-else:
-    print("[脚高] 摆动脚样本为 0：双脚几乎从不同时单支撑（纯贴地/双支撑蹭走）")
-print(f"[接触] 每脚接触时间比例 mean={IC.mean():.3f} (1.0=从不抬脚)")
+for foot_idx, foot_name in enumerate(("right", "left")):
+    sv = FHS[..., foot_idx]
+    sv = sv[~torch.isnan(sv)]
+    contact_rate = IC[..., foot_idx].mean()
+    if sv.numel() > 0:
+        swing_clear_p50 = torch.quantile(sv, 0.5) - foot_origin_offset
+        swing_clear_p95 = torch.quantile(sv, 0.95) - foot_origin_offset
+        low_clearance = (sv - foot_origin_offset < 0.015).float().mean()
+        print(
+            f"[抬脚-{foot_name}] swing={1.0-contact_rate:.3f} contact={contact_rate:.3f} "
+            f"clearance p50/p95={swing_clear_p50*100:.2f}/{swing_clear_p95*100:.2f}cm "
+            f"<1.5cm={low_clearance:.2%} max={(sv.max()-foot_origin_offset)*100:.2f}cm"
+        )
+    else:
+        print(f"[抬脚-{foot_name}] 无摆动样本，contact={contact_rate:.3f}")
+neck_pos_rms = torch.sqrt(torch.mean(torch.square(NECK_POS), dim=(0, 1)))
+neck_target_rms = torch.sqrt(torch.mean(torch.square(NECK_TARGET), dim=(0, 1)))
+neck_action_rms = torch.sqrt(torch.mean(torch.square(NECK_ACTION), dim=(0, 1)))
+print(f"[脖子] q RMS rad={neck_pos_rms.tolist()}")
+print(f"       target RMS rad={neck_target_rms.tolist()} action RMS={neck_action_rms.tolist()}")
 print("===========================================================================\n")
 
 env.close()

@@ -97,14 +97,14 @@ class GaitParams:
     """[m] 参考步态基座高度。<=0 表示自动取 URDF 全零姿态（BDX 标准屈膝站立）的
     FK 站立高度（≈0.385 m），不额外下蹲——腿部伸直余量留给摆动/迈步。"""
 
-    foot_clearance: float = 0.035
-    """[m] 摆动脚抬腿高度（抛物线峰值，脚底离地间隙）。"""
+    foot_clearance: float = 0.05
+    """[m] 摆动脚抬腿高度；为动力学迁移保留约 1.5cm 离地裕量。"""
 
     lateral_sway: float = 0.015
     """[m] 基座向支撑脚侧的侧向重心转移幅度（ZMP 重心 sway 的简化）。"""
 
-    walk_lean_angle: float = 0.087
-    """[rad] ≈5°。满速前进时躯干前倾角，随 vx 比例缩放（后退对称后倾）。
+    walk_lean_angle: float = 0.052
+    """[rad] ≈3°。满速前进时躯干前倾角，随 vx 比例缩放（后退对称后倾）。
     与 cfg.walk_lean_angle 一致。"""
 
     foot_origin_offset: float = 0.067
@@ -358,17 +358,15 @@ def generate_command_gait(
         base_pos_pf[:, 1] = FORWARD_VX_SIGN * params.lateral_sway * np.sin(2.0 * np.pi * phases)
     # path 系躯干偏航（相对 path frame 朝向的 yaw 振荡）：本步态不建模 → 0
     base_yaw_pf = np.zeros(n_phase)
-    # Nominal expressive head motion from the periodic reference. One full gait cycle
-    # contains two steps, so use the second harmonic for one neck bob per footstep.
-    # User head commands are added as offsets at runtime, matching paper Eq. (6).
+    # Nominal vertical head bob. Pure head height uses neck n1/n2 in the same direction;
+    # n3/n4 are yaw/roll and must remain zero unless an explicit head command requests
+    # them. One full gait cycle contains two steps, so use the second harmonic for one
+    # small vertical bob per footstep. User head commands are added separately at runtime.
     neck_pos = np.zeros((n_phase, 4))
     if not standing:
         wave = np.sin(4.0 * np.pi * phases)
-        wave_quadrature = np.cos(4.0 * np.pi * phases)
-        neck_pos[:, 0] = 0.035 * wave_quadrature
-        neck_pos[:, 1] = -0.035 * wave_quadrature
-        neck_pos[:, 2] = 0.045 * wave
-        neck_pos[:, 3] = 0.035 * wave
+        neck_pos[:, 0] = 0.005 * wave
+        neck_pos[:, 1] = 0.005 * wave
     neck_vel = (np.roll(neck_pos, -1, axis=0) - np.roll(neck_pos, 1, axis=0)) / (2.0 * dt)
     if standing:
         neck_vel[:] = 0.0

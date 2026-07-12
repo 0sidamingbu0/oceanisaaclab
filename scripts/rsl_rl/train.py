@@ -61,13 +61,13 @@ RSL_RL_VERSION = "5.0.1"
 
 def _restore_env_curriculum_progress(env_cfg, agent_cfg, checkpoint_path: str) -> None:
     """Restore environment-only curriculum progress that RSL-RL does not checkpoint."""
-    if not getattr(env_cfg, "enable_contact_match_curriculum", False):
+    if not hasattr(env_cfg, "contact_match_curriculum_step_offset"):
         return
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     completed_iterations = int(checkpoint.get("iter", 0))
     env_cfg.contact_match_curriculum_step_offset = completed_iterations * agent_cfg.num_steps_per_env
     print(
-        "[INFO]: Restored contact-match curriculum at "
+        "[INFO]: Restored walk curricula at "
         f"{env_cfg.contact_match_curriculum_step_offset} control steps "
         f"from checkpoint iteration {completed_iterations}."
     )

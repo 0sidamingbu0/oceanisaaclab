@@ -60,8 +60,9 @@ class WalkPPORunnerCfg(PPORunnerCfg):
 
     - actor/critic 各 3×512 ELU（论文：three fully connected layers of 512 hidden
       units and ELU activations，critic 用同规模独立网络）；
-    - PPO：24 steps/env、mini-batch 4、epoch 5、clip 0.2、entropy 0、γ 0.99、
+    - PPO：24 steps/env、mini-batch 4、epoch 5、clip 0.2、γ 0.99、
       GAE λ 0.95、自适应学习率（目标 KL 0.01）、梯度范数 1.0；
+      硬件适配课程使用很小的 entropy 0.001，避免头命令/扰动放开前探索方差过早收缩；
     - 非对称 critic：critic 观测组用环境返回的 "critic"（无噪声观测 + 摩擦/质量
       随机化系数特权信息）。
     - 平面预训练使用论文配置 8192×24；粗糙地形微调由 WalkRoughPPORunnerCfg
@@ -87,7 +88,7 @@ class WalkPPORunnerCfg(PPORunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.0,
+        entropy_coef=0.001,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=3.0e-4,
