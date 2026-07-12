@@ -29,11 +29,11 @@
 | `Ocean-BDX-Stand-Direct-v0` | 路线 A | 手工塑形奖励（速度跟踪 + 步态相位 + 稳定性等 20+ 项），观测 41 维 | `logs/rsl_rl/bdx_walk_phase/` |
 | `Ocean-BDX-Walk-Direct-v0` | 路线 B（行走预训练） | 论文 periodic 行走策略，平面 `8192×24` 高吞吐预训练，观测 80 维、动作 14 | `logs/rsl_rl/bdx_walk_imitation/` |
 | `Ocean-BDX-WalkRough-Direct-v0` | 路线 B（粗糙地形微调） | 与行走预训练相同接口，50% 平面 + 50% `±12mm` 连续粗糙面，`2048×96` | `logs/rsl_rl/bdx_walk_imitation/` |
-| `Ocean-BDX-StandPaper-Direct-v0` | 路线 B（站立） | **BDX 论文 perpetual 站立策略**（无相位，命令 g_perp=躯干4+头部4），观测 74 维、动作 14 | `logs/rsl_rl/bdx_stand_perpetual/` |
+| `Ocean-BDX-StandPaper-Direct-v0` | 路线 B（站立） | **BDX 论文 perpetual 站立策略**（无相位，命令 g_perp=躯干4+头部4），policy/critic `77/79` 维、动作 14 | `logs/rsl_rl/bdx_stand_perpetual/` |
 
 本项目不装足底接触开关，观测里不含双足接触量（接触只用于奖励）。
 
-路线 B 按论文 divide-and-conquer 拆成**两个独立模型**：periodic 行走 + perpetual 站立，运行时按需切换（论文图 9）。2026-07-10 行走观测加入 projected gravity，由 77→80；动作保持 14 维。旧 77 维 checkpoint 与 ONNX 均不兼容，必须重新训练和导出。
+路线 B 按论文 divide-and-conquer 拆成**两个独立模型**：periodic 行走 + perpetual 站立，运行时按需切换（论文图 9）。行走 policy/critic 为 `80/82` 维，站立为 `77/79` 维，动作都为 14 维。旧行走 77 维和旧站立 `74/76` 维 checkpoint/ONNX 均不兼容。站立必须从头重训；本次还把脖子目标纳入与腿一致的 FOH + 37.5Hz 低通，因此现有 80 维行走模型至少要完整回归，推荐重新训练或微调后再导出。
 
 ### 路线 B（行走）：BDX 论文复刻 `Ocean-BDX-Walk-Direct-v0`
 
@@ -57,8 +57,8 @@
   加速度/腿·脖子动作率/动作加速度正则 + 存活，权重×step_dt。
 - **动作管线**（论文 V-C/V-D + 附录 A）：50Hz 策略 → 逐关节线性映射（腿：0=标称站姿，
   1=每关节预期范围 `action_joint_ranges`；脖子：0=默认位，±1=`neck_action_joint_ranges`）→
-  腿围绕实测关节角 ±τmax/kP 限幅 → 一阶保持插值 + 37.5Hz 低通 → 200Hz 附录 B 执行器
-  模型（脖子走位置伺服通路）。
+  腿围绕实测关节角 ±τmax/kP 限幅 → 14 维目标统一做一阶保持插值 + 37.5Hz 低通 →
+  200Hz 附录 B 执行器模型（脖子滤波后进入位置伺服通路）。
 - **执行器模型**（附录 B / 表 VI，Unitree A1/Go1 辨识参数；髋 roll/pitch/膝=A1、
   髋 yaw/踝=Go1；**本机电机若非同款需重新辨识**）：软件 PD + 编码器偏移 ±0.02rad +
   tanh 摩擦 + 速度相关力矩限幅 + 背隙/速度相关噪声编码器读数 + 反射惯量 ±20%，
@@ -103,13 +103,27 @@
 表 V 扰动、域随机化、torso 等效触地终止、非对称 critic、path frame、脖子位置伺服）。
 
 - **命令 g_perp（8 维）**：躯干 4-DOF（h 高度 / pitch 前后倾 / yaw 偏航 / roll 侧倾）
-  + 头部 4-DOF（Δh / pitch / yaw / roll，复用 `neck_head_map`）。
-- **观测 74 维**：相比行走去掉相位二阶谐波(4)、命令由 vx/vy/wz(3) 换成躯干命令(4)
-  （净 −3）；其余（path 系躯干位姿、body 线/角速度、腿+脖子 q/q̇、双帧动作历史）一致。
-  非对称 critic 76 维。
-- **奖励 = 静态姿态模仿**：躯干位置贴双脚中心 / 朝向跟命令 / 高度跟命令，线·角速度→0，
-  腿关节角模仿站立参考（`stand_pose.npz`），脖子跟头部命令参考角，双脚接触，正则 + 存活。
-  站立不存在行走的「站着不动=最优」局部最优，PPO `entropy_coef` 回论文原值 0。
+  + 头部 4-DOF（Δh / pitch / yaw / roll，复用 `neck_head_map`）。本机双脚约束 IK 扫描后的
+  torso 可行域为 h `[-0.04,+0.01]m`、pitch `±0.17rad`、yaw `±0.24rad`、roll
+  `±0.09rad`；命令在 episode 内每 `4-8s` 重采样，覆盖论文要求的连续控制输入。
+- **观测 77 维**：相比行走去掉相位二阶谐波(4)、命令由 vx/vy/wz(3) 换成躯干命令(4)
+  （净 −3）；保留 path 系 xy/yaw、`projected_gravity`、body 线/角速度、腿+脖子 q/q̇、
+  两帧 14 维动作历史。非对称 critic 再加摩擦/质量特权量，共 79 维。
+- **共享零速姿态**：`stand_pose.npz` 的精确零命令、行走参考库零速帧和 URDF q=0 使用同一
+  腿角、base height 与双脚锚点：`q_leg=0`、`base_height=0.38498640060424805m`、
+  `base_pos_pf=[0.04638837,-0.00091510]m`。环境启动时会检查三者一致，避免两策略零速脚距
+  或躯干参考不同。新 `5^4` 参考库最坏脚位置残差为 `2.899mm`，动作映射和软限位夹持数为 0。
+- **奖励 = 论文 Table I**：躯干 path 系 xy/orientation、线·角速度、腿/脖子关节角和速度、
+  双脚接触、全 14 关节力矩/关节加速度、动作平滑及 survival。`torso_pos` 核恢复为 200、
+  orientation 权重恢复为 1、survival 恢复为 20；躯干高度通过站立腿参考表达，不再添加
+  论文之外的独立 height reward。
+- **站立 RSI**：50% episode 使用 torso/head 全零的共享 neutral 状态；其余覆盖完整姿态命令。
+  `stand_rsi_prob=0.8` 时从命令对应参考出生，其余从 neutral 学习过渡。q、FOH/LPF 目标、
+  延迟环和前两帧动作全部初始化为同一个 14 维 setpoint，不再残留 walking RSI 动作。
+- **path frame**：站立分支收敛到双脚中心和消除左右 link-frame 偏置后的双脚平均 heading，
+  不是收敛到躯干 yaw；行走和站立使用同一份 path-frame 状态。
+- **动作与频率**：14 维动作与行走完全同构，50Hz policy / 200Hz low-level，腿和脖子目标都
+  经过 FOH + 37.5Hz 低通。PPO `entropy_coef=0`，其余网络/算法参数沿用论文配置。
 
     ```bash
     # 训练（与行走各训各的，运行时按需切换策略）
@@ -120,6 +134,18 @@
       --task Ocean-BDX-StandPaper-Direct-v0 --num_envs 16 --viz kit \
       --checkpoint logs/rsl_rl/bdx_stand_perpetual/<run>/model_<iter>.pt
     ```
+
+旧 `74/76` 维站立 checkpoint 和 ONNX 不能恢复或部署到当前任务。训练完成后需要重新导出，
+并同步替换 OceanBDX 的 `policy/stand/policy.onnx[.data]`。完整接口与迁移检查见
+[`BDX_STAND_TRAINING.md`](source/oceanisaaclab/docs/BDX_STAND_TRAINING.md)。
+
+运行时切换必须遵循论文 Fig.9：两策略共享最近两帧**实际归一化动作**、path frame 以及腿/脖子
+FOH/LPF 当前目标；stand→walk 在控制周期边界切换并按转向方向初始化行走相位，walk→stand
+等待下一次确认的双支撑再切换，并用切换瞬间的实测躯干高度/姿态初始化 standing torso 命令。
+Python sim2sim 的 path frame 使用脚 link body origin，而非 sole geom center；两者在 q=0 下会
+造成约 `2.585cm` 偏差。起立脚本接管 RL 时另用 `0.5s` 余弦增益过渡，把腿部 `50/3` 平滑降到
+论文 Go1 plant 的 `10/0.3`，并以同一权重从实测 torso 命令起点平滑回用户/neutral 命令、
+渐入腿/脖子策略目标。不能在策略切换时清零动作历史或把滤波目标重置为实测 q。
 
 ### 路线 B 部署（sim2sim / sim2real）：命令如何控制前后左右
 
@@ -136,8 +162,8 @@
    相对 yaw 的 sin/cos）。逐行为复刻 `path_frame.py`（纯 torch，可直接翻 numpy）：
    - `|cmd|` 任一分量 > `move_command_threshold=0.08` → 行走分支：path frame 位置
      按命令速度（先旋到世界系）× dt 积分，yaw 按 wz × dt 积分；
-   - 否则站立分支：一阶低通（时间常数 1.0s）收敛到**双脚中心 xy** 与当前躯干 yaw
-     （需要里程计/状态估计给出躯干世界位姿；双脚中心可用 FK 从关节角+躯干位姿算）；
+   - 否则站立分支：一阶低通（时间常数 1.0s）收敛到**双脚中心 xy** 与校准左右脚 link-frame
+     固有 yaw 偏置后的**双脚平均 heading**（需要里程计/状态估计和双脚 FK）；
    - 每步最后做最大偏差投影：位置偏差钳到 0.25m、yaw 偏差钳到 0.6rad。
    - dt = 策略周期 0.02s（50Hz），与训练一致。
    速度跟踪就是这样隐式实现的：path frame 以命令速度跑，策略只有贴住它才有奖励，
@@ -202,7 +228,8 @@ meshcat（打开日志里打印的 `http://127.0.0.1:7000/static/` 观看）。
     ```
 
 - **站立姿态库** `stand_pose.npz`（站立策略用；躯干命令 4-DOF：h 高度 / pitch / yaw / roll →
-  10 个腿关节角，双脚固定地面）：
+  10 个腿关节角及 path-frame 躯干参考，双脚固定地面；精确零命令强制等于行走零速 q=0
+  公共切换姿态）：
 
     ```bash
     python3 scripts/gen_stand_pose.py                # 生成 assets/gaits/stand_pose.npz

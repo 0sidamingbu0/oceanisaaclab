@@ -325,8 +325,11 @@ def generate_command_gait(
         feet_contact[k] = frame_contact
         max_pos_err = max(max_pos_err, pos_err)
     if standing:  # 站立帧对所有相位常量复制
-        joint_pos[:] = joint_pos[0]
+        # Canonical cross-policy hand-off state: exact URDF q=0, not the tiny residual
+        # returned by the numerical IK solve for otherwise identical foot anchors.
+        joint_pos[:] = 0.0
         feet_contact[:] = feet_contact[0]
+        max_pos_err = 0.0
 
     dt = cmd_period / n_phase
     joint_vel = (np.roll(joint_pos, -1, axis=0) - np.roll(joint_pos, 1, axis=0)) / (2.0 * dt)
@@ -354,7 +357,19 @@ def generate_command_gait(
     # 在 base 系 +y 偏移 +sway(φ)。head-left 轴 = FORWARD_VX_SIGN * base_y = -base_y，
     # 故 path 系 y = -sway(φ) = +lateral_sway*sin(2πφ) 取负。x 方向本步态无前后振荡 → 0。
     base_pos_pf = np.zeros((n_phase, 2))
-    if not standing:
+    if standing:
+        # At zero speed the path frame converges to the mean foot-link origin/heading.
+        # Preserve the real q=0 torso-to-feet offset so walking and standing policies share
+        # one physical hand-off pose instead of both trying to shift the torso over x=0.
+        feet_center = np.mean([anchors[side][:2] for side in "rl"], axis=0)
+        rel_xy = -feet_center
+        head_yaw_offset = 0.0 if FORWARD_VX_SIGN > 0.0 else np.pi
+        cos_y, sin_y = np.cos(head_yaw_offset), np.sin(head_yaw_offset)
+        base_pos_pf[:] = np.array([
+            rel_xy[0] * cos_y + rel_xy[1] * sin_y,
+            -rel_xy[0] * sin_y + rel_xy[1] * cos_y,
+        ])
+    else:
         base_pos_pf[:, 1] = FORWARD_VX_SIGN * params.lateral_sway * np.sin(2.0 * np.pi * phases)
     # path 系躯干偏航（相对 path frame 朝向的 yaw 振荡）：本步态不建模 → 0
     base_yaw_pf = np.zeros(n_phase)
@@ -544,6 +559,10 @@ def main() -> None:
         print("WARNING: IK residual above 5 mm — check workspace / target heights.")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    foot_yaw_neutral = np.array(
+        [np.arctan2(rot0[side][1, 0], rot0[side][0, 0]) for side in "rl"],
+        dtype=np.float32,
+    )
     np.savez_compressed(
         args.out,
         joint_pos=joint_pos,
@@ -566,6 +585,7 @@ def main() -> None:
         gait_duty=np.float32(params.gait_duty),
         forward_vx_sign=np.float32(FORWARD_VX_SIGN),
         foot_clearance=np.float32(params.foot_clearance),
+        foot_yaw_neutral=foot_yaw_neutral,
         joint_names=np.array(LEG_JOINT_NAMES),
     )
     size_kb = args.out.stat().st_size / 1024

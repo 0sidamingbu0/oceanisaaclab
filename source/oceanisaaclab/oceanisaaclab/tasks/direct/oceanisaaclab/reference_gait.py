@@ -52,6 +52,13 @@ class ReferenceGait:
         )
         self.num_phase = self.joint_pos.shape[3]
         self.joint_names = [str(n) for n in data["joint_names"]]
+        # q=0 FK foot-link yaw offsets in [right, left] order. The mirrored link
+        # frames differ by pi; removing these offsets yields a common physical heading.
+        self.foot_yaw_neutral = (
+            tensor("foot_yaw_neutral")
+            if "foot_yaw_neutral" in data.files
+            else torch.tensor([torch.pi, 0.0], dtype=torch.float32, device=self.device)
+        )
         # --- BDX 论文完整目标状态 x_t 的新增字段（旧库回退到兼容默认值） ---
         # path 系躯干 xy 轨迹 (nx,ny,nz,P,2)：行走时的左右重心 sway；旧库 → 0
         if "base_pos_pf" in data.files:
@@ -233,9 +240,26 @@ class StandPose:
         self.joint_pos = tensor("joint_pos")  # (nh, npitch, nyaw, nroll, 10)
         self.joint_names = [str(n) for n in data["joint_names"]]
         self.base_height = float(data["base_height"])
+        if "base_pos_pf" in data.files:
+            self.base_pos_pf = tensor("base_pos_pf")
+        else:
+            # Older stand libraries fixed the torso xy at the path-frame origin but did
+            # not store it explicitly. Keep that physically defined reference as fallback.
+            self.base_pos_pf = torch.zeros(
+                (*self.joint_pos.shape[:-1], 2), dtype=torch.float32, device=self.device
+            )
+        self.base_yaw_pf = (
+            tensor("base_yaw_pf")
+            if "base_yaw_pf" in data.files
+            else torch.zeros(self.joint_pos.shape[:-1], dtype=torch.float32, device=self.device)
+        )
+        self.foot_yaw_neutral = (
+            tensor("foot_yaw_neutral")
+            if "foot_yaw_neutral" in data.files
+            else torch.tensor([torch.pi, 0.0], dtype=torch.float32, device=self.device)
+        )
 
-    def sample(self, torso_cmd: torch.Tensor) -> torch.Tensor:
-        """按躯干命令 (N,4)=(h_torso, pitch, yaw, roll) 四线性插值返回腿关节角 (N,10)。"""
+    def _sample_table(self, torso_cmd: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
         ih0, ih1, wh = ReferenceGait._grid_coords(torso_cmd[:, 0], self.h_grid)
         ip0, ip1, wp = ReferenceGait._grid_coords(torso_cmd[:, 1], self.pitch_grid)
         iy0, iy1, wy = ReferenceGait._grid_coords(torso_cmd[:, 2], self.yaw_grid)
@@ -246,6 +270,18 @@ class StandPose:
                 for cy, fy in ((iy0, 1.0 - wy), (iy1, wy)):
                     for cr, fr in ((ir0, 1.0 - wr), (ir1, wr)):
                         weight = (fh * fp * fy * fr).unsqueeze(-1)
-                        corner = self.joint_pos[ch, cp, cy, cr]  # (N, 10)
+                        corner = table[ch, cp, cy, cr]
                         out = corner * weight if out is None else out + corner * weight
         return out
+
+    def sample(self, torso_cmd: torch.Tensor) -> torch.Tensor:
+        """按躯干命令 (N,4)=(h_torso, pitch, yaw, roll) 四线性插值返回腿关节角 (N,10)。"""
+        return self._sample_table(torso_cmd, self.joint_pos)
+
+    def sample_base_pos_pf(self, torso_cmd: torch.Tensor) -> torch.Tensor:
+        """返回生成器定义的躯干 path-frame xy 参考；它不是估算或伪造的 CoP。"""
+        return self._sample_table(torso_cmd, self.base_pos_pf)
+
+    def sample_base_yaw_pf(self, torso_cmd: torch.Tensor) -> torch.Tensor:
+        """返回 solved torso/head yaw 相对双脚平均 heading 的参考角。"""
+        return self._sample_table(torso_cmd, self.base_yaw_pf.unsqueeze(-1)).squeeze(-1)

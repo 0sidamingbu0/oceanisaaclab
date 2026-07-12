@@ -1,210 +1,233 @@
-# BDX 站立策略训练与迁移说明
+# BDX 论文站立策略训练与部署
 
-本文档记录本 Isaac Lab 工程中 BDX 最小站立策略的训练接口。`/home/ocean/oceanbdx` 的 sim2sim/sim2real 工程可按这里的观测、动作和导出约定迁移。
+本文档描述路线 B 的 perpetual standing policy。它与 periodic walking policy 分开训练，
+但共享机器人模型、14 维动作语义、低层执行器、path frame 和运行时动作历史。
 
-## 任务入口
+## 任务与模型
 
-Gym task id:
-
-```bash
-Ocean-BDX-Stand-Direct-v0
-```
-
-训练入口继续使用本工程已有脚本：
-
-```bash
-./_isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py --task Ocean-BDX-Stand-Direct-v0 --num_envs 2048 --viz kit
-```
-
-回放和导出：
-
-```bash
-./_isaaclab/isaaclab.sh -p scripts/rsl_rl/play.py --task Ocean-BDX-Stand-Direct-v0 --num_envs 16 --checkpoint <model.pt>
-./_isaaclab/isaaclab.sh -p scripts/rsl_rl/play.py --task Ocean-BDX-Stand-Direct-v0 --num_envs 16 --viz kit
-```
-
-`play.py` 会导出：
+任务 id：
 
 ```text
-logs/rsl_rl/bdx_stand_direct/<run>/exported/policy.pt
-logs/rsl_rl/bdx_stand_direct/<run>/exported/policy.onnx
-logs/rsl_rl/bdx_stand_direct/<run>/exported/policy.onnx.data
+Ocean-BDX-StandPaper-Direct-v0
 ```
 
-迁移到 `/home/ocean/oceanbdx` 时，将 `policy.onnx` 和 `policy.onnx.data` 一起放到：
+训练日志与导出目录：
+
+```text
+logs/rsl_rl/bdx_stand_perpetual/<run>/
+logs/rsl_rl/bdx_stand_perpetual/<run>/exported/policy.pt
+logs/rsl_rl/bdx_stand_perpetual/<run>/exported/policy.onnx
+logs/rsl_rl/bdx_stand_perpetual/<run>/exported/policy.onnx.data
+```
+
+站立和行走是两个独立模型：
+
+| 策略 | Policy obs | Critic obs | Action | 相位 | 命令尾部 |
+|---|---:|---:|---:|---|---|
+| StandPaper | 77 | 79 | 14 | 无 | torso 4 + head 4 |
+| Walk | 80 | 82 | 14 | 二阶谐波 4 | velocity 3 + head 4 |
+
+旧 `74/76` 维 StandPaper checkpoint/ONNX 与当前接口不兼容，不能 resume，必须重新训练和导出。
+
+## 观测布局
+
+站立 policy 观测为 77 维：
+
+```text
+[0:2]   torso xy in path frame * 4.0
+[2:4]   sin(yaw_pf), cos(yaw_pf)
+[4:7]   projected gravity in body frame
+[7:10]  body linear velocity * 2.0
+[10:13] body angular velocity * 0.25
+[13:23] leg joint position * 1.0
+[23:27] neck joint position * 1.0
+[27:37] leg joint velocity * 0.05
+[37:41] neck joint velocity * 0.05
+[41:55] a_(t-1), 14-D normalized action
+[55:69] a_(t-2), 14-D normalized action
+[69:73] torso command (h, pitch, yaw, roll) * (10, 1, 1, 1)
+[73:77] head command (dh, pitch, yaw, roll) * (20, 1, 1, 1)
+```
+
+Critic 在无噪声 77 维状态后追加摩擦和质量随机化系数，共 79 维。足底接触只用于奖励和
+切换判定，不进入 policy 观测。`projected_gravity` 必须由 base_link 姿态得到，不能省略；
+它提供站立平衡所需的绝对 roll/pitch 信息。
+
+torso 命令范围来自本机完整 `5^4=625` 点双脚约束 IK 扫描：
+
+```text
+h      [-0.040, +0.010] m
+pitch  [-0.17, +0.17] rad
+yaw    [-0.24, +0.24] rad
+roll   [-0.09, +0.09] rad
+```
+
+torso/head 命令在 episode 内每 `4-8s` 重采样，而不是只在 reset 时固定一次；这对应论文
+perpetual policy 接收连续控制输入的设定。
+
+## 动作与低层控制
+
+动作顺序固定为 10 个腿关节和 4 个脖子关节：
+
+```text
+leg_r1..r5, leg_l1..l5, neck_n1..n4
+```
+
+网络输出先裁剪到 `[-1, 1]`，再逐关节映射：
+
+```text
+leg range  = [0.35, 0.35, 0.8, 0.9, 0.8] * 2
+neck range = [0.8, 0.8, 1.2, 0.7]
+target     = default_joint_pos + range * action
+```
+
+训练控制链与论文一致：
+
+```text
+50Hz policy -> 14-D FOH -> 37.5Hz low-pass -> 200Hz low-level
+```
+
+腿目标还会围绕实测关节角按 `tau_max / kP` 限幅。腿部使用附录 B Go1 软件执行器模型：
+`kP=10`、`kD=0.3`、峰值力矩约 `23.7Nm`，并包含编码器偏移、摩擦、背隙、速度相关力矩
+限制、噪声和反射惯量。脖子目标同样经过 FOH/低通，再进入 `stiffness=50`、`damping=2`
+的位置伺服。旧文档中的统一 `50/2.5` 腿部 PD 和标量 `action_scale=0.25` 不适用于该任务。
+
+## 参考、初始化与脚距
+
+`stand_pose.npz` 的精确零命令被强制为 URDF q=0，并与 `reference_gait.npz` 的零速帧共享：
+
+```text
+base height = 0.38498640060424805 m
+base_pos_pf = [0.04638837, -0.00091510] m
+q_leg       = 0
+foot span   = 0.25169745297 m
+```
+
+环境启动时检查站立/行走零速腿角、base height 和脚 link-frame yaw 标定一致，防止两策略
+在零速下形成不同脚距。
+
+站立 reset 使用独立 RSI，不再执行 walking RSI：
+
+- `stand_zero_command_prob=0.5`：一半环境的 torso/head 命令同时为零，覆盖公共 neutral 状态。
+- `stand_rsi_prob=0.8`：非 neutral 环境可从命令对应参考姿态出生；其余从 neutral 学习过渡。
+- episode 内的 torso/head 命令每 `4-8s` 再采样一次，使策略学习连续姿态切换。
+- 物理 q、动作延迟环、`a_(t-1)`、`a_(t-2)`、腿/脖子 FOH 和低通目标全部由同一个
+  可表示 setpoint 初始化，避免第一步重放陈旧行走动作。
+
+站立 path frame 以 1 秒时间常数收敛到双脚中心和双脚平均 heading。左右脚末端 link frame
+在 q=0 时相差约 pi，因此必须先减去参考资产中的各脚 yaw 偏置，再做圆均值；不能用躯干 yaw
+替代双脚 heading。
+
+## 奖励与扰动
+
+站立使用论文 Table I 权重：
+
+| 项 | 核/权重 |
+|---|---|
+| Torso position xy | `exp(-200 * error^2)`, weight 1 |
+| Torso orientation | `exp(-20 * error^2)`, weight 1 |
+| Linear velocity xy/z | `exp(-8 * error^2)`, weight 1/1 |
+| Angular velocity xy/z | `exp(-2 * error^2)`, weight 0.5/0.5 |
+| Leg / neck joint position | negative L2, 15 / 100 |
+| Leg / neck joint velocity | negative L2, 0.001 / 1 |
+| Contact match | 1 per foot |
+| All joint torques / accelerations | leg + neck negative L2, 0.001 / 2.5e-6 |
+| Leg / neck action rate | negative L2, 1.5 / 5 |
+| Leg / neck action acceleration | negative L2, 0.45 / 5 |
+| Survival | 20 |
+
+躯干高度命令通过站立腿关节参考进入模仿奖励，不再添加论文之外的独立 torso-height reward。
+论文三档扰动从训练开始，在前 1500 iteration 线性放开。
+
+当前站立参考仍是双脚约束的运动学 IK，不是论文原系统的完整逆动力学/CoP 优化，因此通过
+收窄命令域做硬件适配。完整 625 点网格的最大脚位置残差为 `2.899mm`；6250 个腿关节标量中
+没有 action-range 或 soft-limit 夹持，最大原始归一化动作约 `0.7364`。该参考仍不应被解释成
+真实 CoP/ZMP 轨迹。
+
+## 训练、回放与诊断
+
+从头训练：
+
+```bash
+./_isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py \
+  --task Ocean-BDX-StandPaper-Direct-v0 \
+  --num_envs 8192 \
+  --max_iterations 100000 \
+  --headless
+```
+
+回放并导出：
+
+```bash
+./_isaaclab/isaaclab.sh -p scripts/rsl_rl/play.py \
+  --task Ocean-BDX-StandPaper-Direct-v0 \
+  --num_envs 16 \
+  --viz kit \
+  --checkpoint logs/rsl_rl/bdx_stand_perpetual/<run>/model_<iter>.pt
+```
+
+无界面诊断：
+
+```bash
+./_isaaclab/isaaclab.sh -p scripts/diag_stand.py \
+  --checkpoint logs/rsl_rl/bdx_stand_perpetual/<run>/model_<iter>.pt \
+  --num_envs 64 --steps 400 --headless
+```
+
+重点关注 `fall_rate`、双脚接触率、关节速度、动作率、零命令脚距，以及切换第一帧的
+`a_(t-1)/a_(t-2)` 和目标角连续性。
+
+## OceanBDX 部署
+
+将新导出的站立模型文件放到：
+
+```text
+/home/ocean/oceanbdx/policy/stand/policy.onnx
+/home/ocean/oceanbdx/policy/stand/policy.onnx.data
+```
+
+行走模型继续使用：
 
 ```text
 /home/ocean/oceanbdx/policy/policy.onnx
 /home/ocean/oceanbdx/policy/policy.onnx.data
 ```
 
-## 机器人与关节约定
+Python MuJoCo sim2sim 已支持 stand 77 / walk 80 双模型。策略切换必须满足：
 
-训练使用 [../assets/urdf/ocean.urdf](../assets/urdf/ocean.urdf)。
+1. 两个策略共享最近两帧实际归一化动作。
+2. 保留 path frame、当前下发 setpoint、腿/脖子 FOH 和低通状态。
+3. 切换请求只在 200Hz 主控制循环边界消费；stand→walk 初始化合适的行走相位。
+4. walk→stand 等待下一次确认的双支撑，并从实测躯干高度、pitch/yaw/roll 初始化 torso 命令，
+   不把正在行走的姿态突然命令到全零；head 命令保持连续。
+5. 两个策略使用同一套腿部 `10/0.3` 附录 B 低层模型。
+6. `STAND_UP→RL_STAND` 先用实测躯干姿态初始化命令，再用 `0.5s` 余弦接管平滑回
+   用户/neutral 命令，同时渐入腿/脖子策略目标并从脚本 `50/3` 接到 RL `10/0.3`，避免
+   新目标在高增益阶段造成力矩冲击。
 
-腿部 10 关节顺序固定为：
+MuJoCo 的接触判定继续使用 sole geom，但 path-frame 运动学必须使用末端脚 link 的 body
+origin/quaternion，才能对应 IsaacLab 的 `body_pos_w/body_quat_w`。此前使用 sole geom center
+会在 neutral pose 制造约 `2.585cm` 的训练/部署 path-frame 位置偏差。
 
-```text
-[
-  leg_r1_joint, leg_r2_joint, leg_r3_joint, leg_r4_joint, leg_r5_joint,
-  leg_l1_joint, leg_l2_joint, leg_l3_joint, leg_l4_joint, leg_l5_joint,
-]
-```
+OceanBDX 的 C++ 真机主控目前仍是旧 41 维、10 动作、单策略路径；Python `--real` 仅把
+MuJoCo 产生的目标通过桥发送给电机，策略观测仍来自 MuJoCo，不是使用真机状态估计器的完整
+闭环。因此完成 C++ 77/80 双模型、14 动作、path frame、状态估计和切换逻辑前，不能宣称
+真机已支持无缝切换。
 
-脖子关节 `neck_n1_joint` 到 `neck_n4_joint` 不进入动作空间，训练中固定在 0。
+本次脖子 plant 增加了 FOH/低通。旧 80 维 walking ONNX 在维度上仍可加载，但训练 plant
+已经变化，必须至少完整回归零速、各方向行走、头命令和策略切换；推荐重新训练或微调后导出。
 
-默认站姿：
+## 当前验证基线
 
-```text
-default_dof_pos = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-```
-
-也就是 URDF 零位等于站立姿态。实机机械零位和结构限位偏移不要改训练定义，应在 `/home/ocean/oceanbdx/config/oceanbdx.yaml` 的 `calibration` 段处理。
-
-## 观测格式
-
-站立旧版策略观测为 39 维。当前低速行走 v2 策略观测为 41 维，在 `command` 后增加 gait clock：
-
-```text
-obs = [
-  base_ang_vel * 0.25,               # 3, body frame gyro, rad/s
-  projected_gravity,                 # 3, quat_rotate_inverse(q, [0, 0, -1])
-  command * [2.0, 2.0, 1.0],         # 3, [vx, vy, wz]
-  [sin(gait_phase), cos(gait_phase)], # 2, gait_phase cycles with gait_cycle_period
-  (joint_pos - default_dof_pos),     # 10, rad
-  joint_vel * 0.05,                  # 10, rad/s
-  last_action,                       # 10
-]
-```
-
-零速站立时 `command = [0, 0, 0]`。行走/转向时 sim2sim 或部署侧应输入 `[vx, 0, wz]`，左右旋转对应 `wz`。gait phase 可按策略控制周期积分并对 `gait_cycle_period=0.6s` 取模。
-
-YIS320 迁移对应关系：
-
-```text
-quat  -> projected_gravity
-gyro  -> base_ang_vel
-accel -> 当前训练策略不使用
-```
-
-注意 `quat` 必须统一为 `w, x, y, z`。如果 YIS320 输出坐标系和 URDF/base_link 不一致，要先在部署侧做静态坐标变换，再构造 projected gravity。
-
-## 动作格式
-
-策略输出 10 维 `action`，部署侧动作解码为：
-
-```text
-target_q = default_dof_pos + 0.25 * clip(action, -1, 1)
-```
-
-训练中 `default_dof_pos` 为全 0，因此第一版等价于：
-
-```text
-target_q = 0.25 * action
-```
-
-部署侧仍建议保留软限位裁剪和动作变化率限制。
-
-`/home/ocean/oceanbdx/config/oceanbdx.yaml` 中应保持：
-
-```text
-policy.clip_actions = 1.0
-```
-
-训练环境会在 `_pre_physics_step()` 中将策略输出裁剪到 `[-1, 1]`。如果 sim2sim 或实机侧把 `clip_actions` 放大到 `100`，策略目标角会跑出训练分布，常见表现是无外力也站不稳、持续小碎步或向一侧倾倒。
-
-## 控制参数
-
-Isaac Lab 训练配置中腿部 actuator 初值：
-
-```text
-kp = 50.0
-kd = 2.5
-effort_limit = 23.0 N*m
-velocity_limit = 6.0 rad/s
-```
-
-这与 `/home/ocean/oceanbdx/config/oceanbdx.yaml` 里的 `control.rl_kp`、`control.rl_kd`、`torque_limits` 对齐。若实机上必须降增益，推荐先在 sim2sim 和 Isaac 里同步降，再导出新策略。
-
-## 强侧推扰动
-
-当前训练环境已默认加入较强随机侧向外力，用于让策略学会明显的迈步/姿态恢复动作，并方便在 sim2sim 中验证策略是否生效。外力作用在 `base_link`，方向在世界系 XY 平面随机：
-
-```text
-enable_random_push = True
-push_force_range = (35.0, 65.0) N
-push_duration_s = 0.18 s
-push_interval_s = (1.0, 2.0) s
-```
-
-为了让机器人有空间做恢复动作，训练中同步放松了关节回零、关节速度、动作变化率和线速度惩罚。这个版本更适合做“抗侧推 sim2sim 验证”，不再是最安静的原地站立版本。
-
-如果策略在训练早期频繁摔倒，可以先降到 `20-40 N`，训稳后再回到 `35-65 N`：
-
-```bash
-./_isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py --task Ocean-BDX-Stand-Direct-v0 --num_envs 2048 env.push_force_range='(20.0, 40.0)'
-```
-
-如果需要回到无扰动站立基线，可以关闭：
-
-```bash
-./_isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py --task Ocean-BDX-Stand-Direct-v0 --num_envs 2048 env.enable_random_push=False
-```
-
-实机部署侧不要直接复现随机推力，只需要用这个训练出来的策略做外界扰动鲁棒性验证。
-
-## 频率
-
-当前训练环境：
-
-```text
-sim.dt = 1 / 120
-decimation = 2
-policy step = 60 Hz
-```
-
-你补充的实机电机控制上限为 116 Hz。迁移时建议两种选择之一：
-
-1. 实机主循环 116 Hz，策略每 2 个周期运行一次，约 58 Hz。最接近当前训练的 60 Hz。
-2. 若要策略 116 Hz，训练侧应把 `decimation` 或 `sim.dt` 同步调整后重新训练。
-
-`/home/ocean/oceanbdx/config/oceanbdx.yaml` 的 sim2sim 推荐先用 `dt=0.005, decimation=3`，即 200 Hz 主循环、约 66.7 Hz 策略，接近训练的 60 Hz。若后续对齐真机 116 Hz 总线，推荐主循环 116 Hz、策略每 2 个周期运行一次，约 58 Hz。
-
-## 训练文件
-
-主要实现文件：
-
-```text
-source/oceanisaaclab/oceanisaaclab/tasks/direct/oceanisaaclab/oceanisaaclab_env_cfg.py
-source/oceanisaaclab/oceanisaaclab/tasks/direct/oceanisaaclab/oceanisaaclab_env.py
-source/oceanisaaclab/oceanisaaclab/tasks/direct/oceanisaaclab/agents/rsl_rl_ppo_cfg.py
-source/oceanisaaclab/oceanisaaclab/tasks/direct/oceanisaaclab/__init__.py
-```
-
-## 上实机前检查
-
-迁移到 `oceanbdx` 前必须逐项确认：
-
-1. Isaac Lab 解析出的 `robot.joint_names` 与 `oceanbdx.yaml` 的 `joint_names` 顺序一致。
-2. 低速行走 v2 的 `policy.num_obs` 应为 41；旧站立 39 维策略不能和 v2 checkpoint 混用。
-3. `default_dof_pos` 为全 0。
-4. `action_scale = 0.25`。
-5. `clip_actions = 1.0`。
-6. `ang_vel_scale = 0.25`，`dof_pos_scale = 1.0`，`dof_vel_scale = 0.05`。
-7. 低速行走 v2 的 `commands_scale = [2.0, 2.0, 1.0]`。
-8. 低速行走 v2 必须在 command 后拼接 `[sin(gait_phase), cos(gait_phase)]`。
-9. IMU 四元数顺序和坐标系已对齐 base_link。
-10. 真机先吊起或支撑测试，确认 10 个关节目标方向正确后再落地。
-
-## 后续低速行走扩展
-
-当前低速行走 v2 已使用 `command = [vx, vy, wz]` 和 gait clock。训练配置：
-
-```text
-command sampling: vx 0.10-0.35 m/s (训练早期由命令课程压到 0.15-0.30), vy 0, wz -0.8-0.8 rad/s
-reward: linear velocity tracking (sigma=0.06), yaw tracking, phase support-contact + swing-contact penalty,
-        foot slip penalty, foot-sole clearance (脚底间隙, 减去 foot_origin_offset=0.067), action smoothness
-termination: base height, projected gravity, joint limits
-```
-
-动作和部署接口保持不变。
+- 64 env、1 PPO iteration smoke test：`77/79/14`，`fall_rate=0`，无 traceback/NaN。
+- 范围内非零 yaw RSI：参考重构误差约 `2.7e-7rad`，solved/Isaac 双脚 heading 差约
+  `0.00176rad`。
+- reset 后腿/脖子 target-q、动作延迟环和前两帧动作误差均为 0。
+- stand/walk q=0 脚距差约 `2.1e-12m`，base height 与 `base_pos_pf` 完全一致。
+- 站立参考最坏 IK 残差 `2.899mm`，action-range/soft-limit 夹持为 0。
+- Python sim2sim 轻量测试通过 77/80 维观测、动作历史传递、控制周期边界、当前/下一双支撑、
+  零速冻结及超时取消逻辑。
+- 真实 MuJoCo 用当前 80 维 walking policy 作为 standing fallback 验证接管状态机：首个 RL
+  控制步腿目标/力矩跳变为 `2.24e-5rad / 0.079Nm`，整个 `0.5s` 窗口最大单步变化为
+  `0.00681rad / 0.175Nm`；10 秒末仍为双脚支撑的 `RL_STAND`。该测试不能替代重新训练后的
+  77 维 standing policy 闭环验收。

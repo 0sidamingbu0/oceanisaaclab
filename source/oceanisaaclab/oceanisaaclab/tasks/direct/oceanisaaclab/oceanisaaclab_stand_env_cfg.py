@@ -12,11 +12,12 @@
 
 - 继承 OceanisaaclabWalkEnvCfg：复用附录 B 执行器模型、表 V 扰动、域随机化、torso 等效触地
   终止、非对称 critic、path frame、脖子位置伺服、脖子/头部命令映射。
-- 观测 74 维（去 phase 谐波4；命令 torso4+head4=8）：
-  p_pf2 + yaw_pf2 + lin_vel3 + ang_vel3 + q_leg10 + q_neck4 + qd_leg10 + qd_neck4
-  + a_{t-1}14 + a_{t-2}14 + g_perp8 = 74。critic + 摩擦 + 质量 = 76。
+- 观测 77 维（去 phase 谐波4；命令 torso4+head4=8）：
+  p_pf2 + yaw_pf2 + projected_gravity3 + lin_vel3 + ang_vel3 + q_leg10 + q_neck4
+  + qd_leg10 + qd_neck4 + a_{t-1}14 + a_{t-2}14 + g_perp8 = 77。
+  critic + 摩擦 + 质量 = 79。
 - 参考 = 站立姿态库（scripts/gen_stand_pose.py，按躯干命令 4-DOF 插值腿角）+ 脖子头部映射。
-- 奖励 = 静态姿态模仿：躯干位置/朝向/高度 + 线/角速度→0 + 腿/脖子关节角模仿 + 双脚接触
+- 奖励 = 静态姿态模仿：躯干位置/朝向 + 线/角速度→0 + 腿/脖子关节角模仿 + 双脚接触
   + 正则 + 存活。去掉行走的步态时序/参考速度跟踪。
 """
 
@@ -34,10 +35,11 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     # 空间维度（无相位 + g_perp 8 维命令）
     # ------------------------------------------------------------------
     action_space = 14  # 同行走：10 腿 + 4 脖子
-    # 74 = p_pf2 + yaw_pf2 + lin_vel3 + ang_vel3 + q_leg10 + q_neck4 + qd_leg10
-    #      + qd_neck4 + a_{t-1}14 + a_{t-2}14 + torso_cmd4 + head_cmd4（无 phase）
-    observation_space = 74
-    state_space = 76  # + 摩擦 + 质量
+    # 77 = p_pf2 + yaw_pf2 + projected_gravity3 + lin_vel3 + ang_vel3 + q_leg10
+    #      + q_neck4 + qd_leg10 + qd_neck4 + a_{t-1}14 + a_{t-2}14
+    #      + torso_cmd4 + head_cmd4（无 phase）
+    observation_space = 77
+    state_space = 79  # + 摩擦 + 质量
 
     # ------------------------------------------------------------------
     # 站立姿态参考库（scripts/gen_stand_pose.py 生成）
@@ -48,32 +50,35 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     # 躯干命令 g_perp 的 (h_torso, θ_torso) 部分：4-DOF 高度 + 朝向。
     # 范围须与 gen_stand_pose.py 网格一致（超范围会被采样器钳到边界）。
     # ------------------------------------------------------------------
-    torso_command_h_range = (-0.05, 0.02)  # [m] 躯干高度偏移（蹲下为负；升高受腿伸直限）
-    torso_command_pitch_range = (-0.25, 0.25)  # [rad] 前后倾
-    torso_command_yaw_range = (-0.35, 0.35)  # [rad] 原地偏航
-    torso_command_roll_range = (-0.18, 0.18)  # [rad] 侧倾
+    # 对本机 5^4 完整网格做 IK 扫描后的可行域：最大脚位置残差 2.899 mm。
+    torso_command_h_range = (-0.04, 0.01)  # [m] 躯干高度偏移（蹲下为负；升高受腿伸直限）
+    torso_command_pitch_range = (-0.17, 0.17)  # [rad] 前后倾
+    torso_command_yaw_range = (-0.24, 0.24)  # [rad] 原地偏航
+    torso_command_roll_range = (-0.09, 0.09)  # [rad] 侧倾
     # obs 缩放：h 量级小放大到与角度可比（obs_normalization 亦会归一）
     torso_command_scale = (10.0, 1.0, 1.0, 1.0)
     # 站立命令零概率：一部分 env 命令全零（标称直立），其余均匀采样各姿态
-    stand_zero_command_prob = 0.1
+    stand_zero_command_prob = 0.5
 
     # ------------------------------------------------------------------
     # 站立参考初始化（RSI）：从命令对应的站立参考姿态出生，避免第一步从 default 跳变。
     # 站立不存在"站着不动=最优"的局部最优（本来就要站稳），rsi 用来加速姿态成形。
     # ------------------------------------------------------------------
     stand_rsi_prob = 0.8
+    stand_rsi_joint_pos_noise = 0.01  # [rad]，仅非零命令 RSI 使用
+    # 禁止父类 walking RSI 写入随机步态帧；站立环境使用上面的独立 RSI。
+    rsi_prob = 0.0
 
     # ------------------------------------------------------------------
     # 奖励权重（静态姿态模仿）。权重×step_dt。
-    # 复用行走的公共项，改：加大躯干朝向权重（站立核心=摆姿态）、新增躯干高度模仿、
-    # 线/角速度目标改为 0（惩罚移动）、腿关节角模仿站立参考（-15 即可，无需 -25 逼迈步）。
+    # 对齐论文表 I。躯干高度命令通过腿关节参考姿态进入模仿项，不额外增加论文之外的
+    # height reward；线/角速度目标改为 0，腿关节角模仿站立参考。
     # ------------------------------------------------------------------
-    rew_w_torso_pos_xy = 1.0  # 躯干在双脚中心上方（pos_pf → 参考 sway=0）
-    rew_k_torso_pos_xy = 30.0
-    rew_w_torso_orient = 2.0  # 躯干朝向跟命令 (pitch,yaw,roll)；站立核心项，加大
+    rew_w_torso_pos_xy = 1.0  # 跟踪离线 solved 躯干相对双脚中心的 path-frame xy
+    rew_k_torso_pos_xy = 200.0
+    rew_w_torso_orient = 1.0  # 躯干朝向跟命令 (pitch,yaw,roll)
     rew_k_torso_orient = 20.0
-    rew_w_torso_height = 2.0  # 躯干高度跟命令 base_height + h_torso（站立新增项）
-    rew_k_torso_height = 200.0  # exp(-200·Δh²)：3cm 误差 exp≈0.16
+    rew_w_torso_height = 0.0  # 论文表 I 无独立躯干高度奖励
     rew_w_lin_vel_xy = 1.0  # 目标 0：惩罚水平移动
     rew_k_lin_vel = 8.0
     rew_w_lin_vel_z = 1.0
@@ -92,4 +97,8 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     rew_w_neck_joint_vel = -1.0
     rew_w_neck_action_rate = -5.0
     rew_w_neck_action_acc = -5.0
-    rew_w_survival = 2.0
+    rew_w_survival = 20.0
+
+    # 论文站立扰动从训练开始用 1500 iteration（24 steps/iter）线性放开。
+    disturbance_curriculum_delay_steps = 0
+    disturbance_curriculum_steps = 36_000

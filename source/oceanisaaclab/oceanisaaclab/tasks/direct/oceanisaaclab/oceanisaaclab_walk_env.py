@@ -35,7 +35,7 @@ from isaaclab.utils.math import euler_xyz_from_quat, quat_error_magnitude, quat_
 
 from .oceanisaaclab_env import OceanisaaclabEnv
 from .oceanisaaclab_walk_env_cfg import OceanisaaclabWalkEnvCfg
-from .path_frame import PathFrame
+from .path_frame import PathFrame, wrap_angle
 from .reference_gait import NeckHeadMap, ReferenceGait
 
 
@@ -154,6 +154,8 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             :, self._neck_dof_idx
         ].clone()
         self._neck_target = self._default_neck_joint_pos.clone()
+        self._prev_neck_target = self._default_neck_joint_pos.clone()
+        self._filtered_neck_target = self._default_neck_joint_pos.clone()
         self._head_commands = torch.zeros(self.num_envs, 4, device=self.device)
         self._control_resample_left = torch.zeros(self.num_envs, device=self.device)
         self._head_command_scale = torch.tensor(
@@ -315,6 +317,23 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         _, _, yaw = euler_xyz_from_quat(self.robot.data.root_quat_w.torch)
         return yaw + self._head_yaw_offset
 
+    def _feet_heading_yaw(self) -> torch.Tensor:
+        """Return the calibrated circular mean heading of both feet.
+
+        The URDF mirrors the right/left terminal link frames, so their raw yaw differs
+        by approximately pi in the shared q=0 stance. The gait asset stores those q=0
+        FK offsets in right/left order; subtracting them before averaging recovers one
+        physical heading in the same head-forward convention as the path frame.
+        """
+        foot_quat = self.robot.data.body_quat_w.torch[:, self._feet_body_ids]
+        _, _, foot_yaw = euler_xyz_from_quat(foot_quat.reshape(-1, 4))
+        foot_yaw = foot_yaw.view(self.num_envs, len(self._feet_body_ids))
+        relative_yaw = wrap_angle(
+            foot_yaw - self._reference_gait.foot_yaw_neutral.unsqueeze(0)
+        )
+        heading = relative_yaw + self._head_yaw_offset
+        return torch.atan2(torch.sin(heading).mean(dim=1), torch.cos(heading).mean(dim=1))
+
     def _moving_mask(self) -> torch.Tensor:
         return (
             torch.max(torch.abs(self._commands[:, :2]), dim=1).values > self.cfg.move_command_threshold
@@ -401,6 +420,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         # 脖子位置目标：后 4 维动作线性映射到默认位 ± range，clamp 到脖子软限位
         delayed_neck = delayed_actions[:, self._neck_action_slice]
         neck_target = self._default_neck_joint_pos + self._neck_joint_ranges * delayed_neck
+        self._prev_neck_target = self._neck_target
         self._neck_target = torch.clamp(
             neck_target,
             self._soft_neck_joint_pos_limits[:, :, 0],
@@ -422,6 +442,10 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         u = self._prev_target_joint_pos + frac * (self._target_joint_pos - self._prev_target_joint_pos)
         self._filtered_joint_target = self._filtered_joint_target + self._lowpass_alpha * (
             u - self._filtered_joint_target
+        )
+        neck_u = self._prev_neck_target + frac * (self._neck_target - self._prev_neck_target)
+        self._filtered_neck_target = self._filtered_neck_target + self._lowpass_alpha * (
+            neck_u - self._filtered_neck_target
         )
         q = self.robot.data.joint_pos.torch[:, self._leg_dof_idx]
         qd = self.robot.data.joint_vel.torch[:, self._leg_dof_idx]
@@ -453,8 +477,10 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             self.robot.set_joint_effort_target_index(target=tau, joint_ids=self._leg_dof_idx)
         else:
             self.robot.set_joint_effort_target(tau, joint_ids=self._leg_dof_idx)
-        # 脖子：位置伺服跟随学习到的目标（头部命令参考角），每子步保持同一目标
-        self.robot.set_joint_position_target_index(target=self._neck_target, joint_ids=self._neck_dof_idx)
+        # 脖子同样经过论文的 FOH + 37.5Hz 低通，再交给位置伺服。
+        self.robot.set_joint_position_target_index(
+            target=self._filtered_neck_target, joint_ids=self._neck_dof_idx
+        )
 
     def _update_paper_disturbances(self) -> None:
         if not self._disturbances:
@@ -666,6 +692,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             self.robot.data.root_pos_w.torch[:, :2],
             self._head_yaw(),
             feet_center,
+            self._feet_heading_yaw(),
         )
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         base_height = self.robot.data.root_pos_w.torch[:, 2] - self.scene.env_origins[:, 2]
@@ -954,6 +981,8 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         reset_ref = self._reference_gait.sample(self._commands[env_ids], self._phase[env_ids])
         neck_ref_reset = reset_ref["neck_pos"] + self._neck_head_map.sample(self._head_commands[env_ids])
         self._neck_target[env_ids] = neck_ref_reset
+        self._prev_neck_target[env_ids] = neck_ref_reset
+        self._filtered_neck_target[env_ids] = neck_ref_reset
         reset_actions = torch.zeros(n, self.cfg.action_space, device=self.device)
         reset_actions[:, self._neck_action_slice] = torch.clamp(
             (neck_ref_reset - self._default_neck_joint_pos[env_ids]) / self._neck_joint_ranges,
@@ -981,7 +1010,17 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             sched.reset(env_ids)
 
         # ---- RSI：部分 env 从随机相位参考帧出发 ----
-        pf_offset = None
+        # Zero-speed resets start at the converged shared stand/walk path frame so q=0 is
+        # already the common hand-off state. Moving resets still begin at the torso state.
+        pf_offset = torch.zeros(n, 2, device=self.device)
+        standing_reset = ~self._moving_mask()[env_ids]
+        if torch.any(standing_reset):
+            standing_count = int(standing_reset.sum().item())
+            neutral_ref = self._reference_gait.sample(
+                torch.zeros(standing_count, 3, device=self.device),
+                torch.zeros(standing_count, device=self.device),
+            )
+            pf_offset[standing_reset] = neutral_ref["base_pos_pf"]
         rsi_prob = self.cfg.rsi_prob
         rsi_joint_pos_noise = self.cfg.rsi_joint_pos_noise
         rsi = torch.rand(n, device=self.device) < rsi_prob
@@ -1030,6 +1069,5 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             self._prev_prev_actions[rsi_ids] = rsi_actions
             self._action_history[rsi_ids] = rsi_actions.unsqueeze(1)
             # path frame 原点偏移，使躯干出生即位于参考 sway 相位上
-            pf_offset = torch.zeros(n, 2, device=self.device)
             pf_offset[rsi] = ref["base_pos_pf"]
         self._reset_path_frame(env_ids, pf_offset)

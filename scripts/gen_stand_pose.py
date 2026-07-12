@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gen_reference_gait import (  # noqa: E402
     DEFAULT_MESH_DIR,
     DEFAULT_URDF,
+    FORWARD_VX_SIGN,
     LEG_JOINT_NAMES,
     REPO_ROOT,
     GaitParams,
@@ -56,33 +57,45 @@ def _rot_x(a: float) -> np.ndarray:
     return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
 
 
+def _wrap_angle(a: float) -> float:
+    return float(np.arctan2(np.sin(a), np.cos(a)))
+
+
 @dataclass
 class StandParams:
     """站立躯干命令网格参数（4-DOF：Δh_torso / pitch / yaw / roll）。范围取站得稳的保守值。"""
 
-    dh_max: float = 0.05
+    dh_max: float = 0.04
     """[m] 躯干高度偏移网格半幅（蹲下为负、升高为正；升高受腿伸直限制，见 dh_up_max）。"""
 
-    dh_up_max: float = 0.02
+    dh_up_max: float = 0.01
     """[m] 升高方向单独上限（腿接近伸直，抬高余量小）。网格用 [-dh_max, dh_up_max]。"""
 
-    pitch_max: float = 0.25
+    pitch_max: float = 0.17
     """[rad] 躯干前后倾网格半幅。"""
 
-    yaw_max: float = 0.35
+    yaw_max: float = 0.24
     """[rad] 躯干原地偏航网格半幅（脚固定，靠髋 yaw 扭转，范围保守）。"""
 
-    roll_max: float = 0.18
+    roll_max: float = 0.09
     """[rad] 躯干侧倾网格半幅（单足无踝 roll，侧倾靠髋，范围保守）。"""
 
     grid: int = 5
-    """每轴网格点数（奇数含 0/标称站姿）。5⁴=625 个姿态。"""
+    """每轴网格点数。高度轴显式包含 0；默认 5⁴=625 个姿态。"""
 
     ik_iterations: int = 150
     """每个姿态 placo 迭代次数（连续 warm-start 下足够收敛）。"""
 
     def dh_grid(self) -> np.ndarray:
-        return np.linspace(-self.dh_max, self.dh_up_max, self.grid)
+        if self.grid < 3:
+            raise ValueError("stand pose grid must contain at least 3 points")
+        # 高度范围不对称，直接对 [-0.04, 0.01] 做偶数间隔不会可靠命中 0。分别在
+        # 负/正半轴采样，保证 exact zero command 对应一个真实网格点。
+        n_negative = self.grid // 2
+        n_positive = self.grid - n_negative - 1
+        negative = np.linspace(-self.dh_max, 0.0, n_negative + 1)[:-1]
+        positive = np.linspace(0.0, self.dh_up_max, n_positive + 1)[1:]
+        return np.concatenate((negative, np.array([0.0]), positive))
 
     def pitch_grid(self) -> np.ndarray:
         return np.linspace(-self.pitch_max, self.pitch_max, self.grid)
@@ -117,7 +130,10 @@ def generate(params: StandParams, urdf: Path, mesh_dir: Path) -> dict:
     ik = PlacoGaitIK(robot, gait_params)
     anchors, rot0 = ik.anchors()  # q=0 时双脚在 base 系（=world，base 在原点）的位姿
     # 标称站高：脚底贴地 → base_height = foot_origin_offset − 脚原点 z（base 系，负值）
-    base_height = gait_params.foot_origin_offset - float(min(anchors["r"][2], anchors["l"][2]))
+    # 与 walking reference 使用同一 FK 定义：两脚 q=0 锚点高度的平均值。
+    base_height = float(np.mean([
+        gait_params.foot_origin_offset - anchors[side][2] for side in "rl"
+    ]))
 
     dh_grid = params.dh_grid()
     pitch_grid = params.pitch_grid()
@@ -125,6 +141,49 @@ def generate(params: StandParams, urdf: Path, mesh_dir: Path) -> dict:
     roll_grid = params.roll_grid()
     nh, npi, ny, nr = len(dh_grid), len(pitch_grid), len(yaw_grid), len(roll_grid)
     joint_pos = np.zeros((nh, npi, ny, nr, 10), dtype=np.float32)
+    # Torso world xy is fixed at the base origin. The path frame converges to the solved
+    # feet center/heading, so the torso reference generally has a non-zero forward offset.
+    # This is a kinematic reference, not a CoP/ZMP estimate.
+    base_pos_pf = np.zeros((nh, npi, ny, nr, 2), dtype=np.float32)
+    # 两只脚的 URDF link frame 朝向不同（右脚约 π、左脚约 0）。保存 q=0
+    # 世界 yaw，运行时先消去各自 link-frame 偏置，再求双脚平均 heading。
+    foot_yaw_neutral = np.array(
+        [np.arctan2(rot0[side][1, 0], rot0[side][0, 0]) for side in "rl"],
+        dtype=np.float32,
+    )
+    base_yaw_pf = np.zeros((nh, npi, ny, nr), dtype=np.float32)
+    head_yaw_offset = 0.0 if FORWARD_VX_SIGN > 0.0 else np.pi
+
+    def solved_base_reference(
+        height: float, pitch: float, yaw: float, roll: float
+    ) -> tuple[np.ndarray, float]:
+        """Torso xy/yaw in the calibrated path frame of the solved feet."""
+        R_wb = _rot_z(yaw) @ _rot_y(pitch) @ _rot_x(roll)
+        foot_positions = []
+        foot_headings = []
+        for foot_id, side in enumerate("rl"):
+            # Placo keeps base_link at identity; convert the solved base-frame foot
+            # pose to the commanded torso world frame before path-frame calibration.
+            T_bf = robot.get_T_world_frame(ik.FOOT_FRAMES[side])
+            foot_positions.append(np.array([0.0, 0.0, height]) + R_wb @ T_bf[:3, 3])
+            R_bf = T_bf[:3, :3]
+            R_wf = R_wb @ R_bf
+            raw_yaw = float(np.arctan2(R_wf[1, 0], R_wf[0, 0]))
+            relative_yaw = _wrap_angle(raw_yaw - float(foot_yaw_neutral[foot_id]))
+            foot_headings.append(relative_yaw + head_yaw_offset)
+        feet_heading = float(np.arctan2(
+            np.mean(np.sin(foot_headings)),
+            np.mean(np.cos(foot_headings)),
+        ))
+        feet_center = np.mean(foot_positions, axis=0)
+        rel_xy = -feet_center[:2]
+        cos_y, sin_y = np.cos(feet_heading), np.sin(feet_heading)
+        torso_pos_pf = np.array([
+            rel_xy[0] * cos_y + rel_xy[1] * sin_y,
+            -rel_xy[0] * sin_y + rel_xy[1] * cos_y,
+        ])
+        head_yaw = yaw + head_yaw_offset
+        return torso_pos_pf, _wrap_angle(head_yaw - feet_heading)
 
     def solve_pose(dh: float, pitch: float, yaw: float, roll: float) -> tuple[np.ndarray, float]:
         R_wb = _rot_z(yaw) @ _rot_y(pitch) @ _rot_x(roll)  # 躯干世界朝向
@@ -154,11 +213,38 @@ def generate(params: StandParams, urdf: Path, mesh_dir: Path) -> dict:
                         float(yaw_grid[iy]), float(roll_grid[ir]),
                     )
                     joint_pos[ih, ip, iy, ir] = q
+                    pose_pos_pf, pose_yaw_pf = solved_base_reference(
+                        base_height + float(dh_grid[ih]),
+                        float(pitch_grid[ip]),
+                        float(yaw_grid[iy]),
+                        float(roll_grid[ir]),
+                    )
+                    base_pos_pf[ih, ip, iy, ir] = pose_pos_pf
+                    base_yaw_pf[ih, ip, iy, ir] = pose_yaw_pf
                     worst = max(worst, err)
                     done += 1
         print(f"  [{done}/{total}] dh={dh_grid[ih]:+.3f} done, worst foot err so far {worst*1000:.2f} mm")
 
     print(f"worst foot position residual: {worst*1000:.3f} mm")
+    if worst > 0.005:
+        print("WARNING: stand IK residual above 5 mm at command-grid edges; review command limits.")
+    zero_idx = (
+        int(np.flatnonzero(np.isclose(dh_grid, 0.0))[0]),
+        int(np.flatnonzero(np.isclose(pitch_grid, 0.0))[0]),
+        int(np.flatnonzero(np.isclose(yaw_grid, 0.0))[0]),
+        int(np.flatnonzero(np.isclose(roll_grid, 0.0))[0]),
+    )
+    # Shared stand/walk handoff state: the URDF q=0 pose is the canonical zero-speed
+    # stance. Do not retain solver residuals at the exact neutral command.
+    joint_pos[zero_idx] = 0.0
+    neutral_feet_center = np.mean([anchors[side][:2] for side in "rl"], axis=0)
+    neutral_rel = -neutral_feet_center
+    cos_y, sin_y = np.cos(head_yaw_offset), np.sin(head_yaw_offset)
+    base_pos_pf[zero_idx] = np.array([
+        neutral_rel[0] * cos_y + neutral_rel[1] * sin_y,
+        -neutral_rel[0] * sin_y + neutral_rel[1] * cos_y,
+    ])
+    base_yaw_pf[zero_idx] = 0.0
     print(f"nominal base_height = {base_height:.4f} m")
     return dict(
         torso_h_grid=dh_grid.astype(np.float32),
@@ -166,6 +252,9 @@ def generate(params: StandParams, urdf: Path, mesh_dir: Path) -> dict:
         torso_yaw_grid=yaw_grid.astype(np.float32),
         torso_roll_grid=roll_grid.astype(np.float32),
         joint_pos=joint_pos,
+        base_pos_pf=base_pos_pf,
+        base_yaw_pf=base_yaw_pf,
+        foot_yaw_neutral=foot_yaw_neutral,
         joint_names=np.array(LEG_JOINT_NAMES),
         base_height=np.float32(base_height),
         foot_origin_offset=np.float32(gait_params.foot_origin_offset),

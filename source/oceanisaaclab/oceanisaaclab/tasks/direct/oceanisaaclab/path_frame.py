@@ -8,7 +8,7 @@
 每个 env 维护一个平面坐标系状态 (x, y, yaw)，其中 +x 轴 = 头部前向：
 
 - **行走**（非零命令）：按 path 系速度命令 (v_x, v_y, ω_z) 逐步积分推进；
-- **站立**（零命令）：一阶低通收敛到双脚中心位置与当前躯干朝向
+- **站立**（零命令）：一阶低通收敛到双脚中心位置与双脚平均朝向
   （论文：converges towards the average position and heading of the feet）；
 - **最大偏差投影**：path frame 与躯干实际位置/朝向的偏差超阈值时把 path frame
   拉回（论文：f_t is projected to a maximum distance from the current torso
@@ -63,6 +63,7 @@ class PathFrame:
         base_pos_xy: torch.Tensor,
         head_yaw: torch.Tensor,
         feet_center_xy: torch.Tensor,
+        feet_heading_yaw: torch.Tensor,
     ) -> None:
         """推进一个控制步。
 
@@ -73,6 +74,7 @@ class PathFrame:
             base_pos_xy: (N,2) 躯干世界系 xy。
             head_yaw: (N,) 躯干头部前向朝向（世界系）。
             feet_center_xy: (N,2) 双脚中心世界系 xy（站立收敛目标）。
+            feet_heading_yaw: (N,) 双脚平均 heading（世界系，已校准左右 link-frame 偏置）。
         """
         # 行走：按命令积分。命令是 path 系的 → 旋转到世界系再积分。
         cos_y, sin_y = torch.cos(self.yaw), torch.sin(self.yaw)
@@ -80,10 +82,10 @@ class PathFrame:
         dy_w = commands[:, 0] * sin_y + commands[:, 1] * cos_y
         walk_pos = self.pos + torch.stack((dx_w, dy_w), dim=1) * dt
         walk_yaw = self.yaw + commands[:, 2] * dt
-        # 站立：一阶低通收敛到双脚中心 + 躯干朝向。
+        # 站立：一阶低通收敛到双脚中心 + 双脚平均 heading（论文 V-A）。
         alpha = min(1.0, dt / self.stand_time_constant)
         stand_pos = self.pos + alpha * (feet_center_xy - self.pos)
-        stand_yaw = self.yaw + alpha * wrap_angle(head_yaw - self.yaw)
+        stand_yaw = self.yaw + alpha * wrap_angle(feet_heading_yaw - self.yaw)
         m = moving.unsqueeze(1).float()
         self.pos = m * walk_pos + (1.0 - m) * stand_pos
         self.yaw = wrap_angle(moving.float() * walk_yaw + (1.0 - moving.float()) * stand_yaw)
