@@ -18,14 +18,15 @@
 - 动作管线（V-C/V-D 节）：50Hz 策略 → 逐关节线性映射（0=标称站姿）→ 围绕实测关节角
   限幅（δ=τmax/kP）→ 一阶保持插值 + 37.5Hz 低通 → 200Hz 附录 B 执行器模型
   （软件 PD + 编码器偏移 + 摩擦 + 速度相关力矩限幅 + 背隙/噪声编码器读数 + 反射惯量）。
-- 扰动 = 论文表 V 三档独立进程（幅度按整机质量 ≈10kg/15.4kg 缩放），基础步态
-  等待阶段后线性放开。
+- 扰动 = 论文表 V 三档独立进程（幅度按整机质量 ≈10kg/15.4kg 缩放），从训练开始
+  并在前 1500 iteration 线性放开。
 """
 
 import isaaclab.sim as sim_utils
 import isaaclab.terrains as terrain_gen
 from isaaclab.sim import SimulationCfg
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import RayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 from isaaclab.utils.configclass import configclass
@@ -44,11 +45,27 @@ WALK_TERRAINS_CFG = TerrainGeneratorCfg(
     vertical_scale=0.0025,
     slope_threshold=0.75,
     sub_terrains={
-        "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.5),
+        "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.40),
         "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
-            proportion=0.5,
+            proportion=0.30,
             noise_range=(-0.012, 0.012),
             noise_step=0.004,
+            border_width=0.25,
+        ),
+        # Isaac Lab's height-field implementation interprets slope as rise/run. 0.0875
+        # corresponds to atan(0.0875) ~= 5 degrees. A 2 m center platform matches
+        # TerrainImporter's spawn-height search window; walking outward then enters a
+        # 1 m sustained uphill/downhill segment without a reset drop.
+        "up_slope": terrain_gen.HfInvertedPyramidSlopedTerrainCfg(
+            proportion=0.15,
+            slope_range=(0.0, 0.0875),
+            platform_width=2.0,
+            border_width=0.25,
+        ),
+        "down_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+            proportion=0.15,
+            slope_range=(0.0, 0.0875),
+            platform_width=2.0,
             border_width=0.25,
         ),
     },
@@ -238,7 +255,7 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     # view 在大规模场景中存在漏报/错误聚合，因此用 base collision 高度与倾角
     # 做等效判定。base mesh 最低点相对 root 约 -0.185m，0.20m 覆盖 ±12mm roughness。
     # ------------------------------------------------------------------
-    walk_min_base_height = 0.20  # [m], root height relative to the terrain origin
+    walk_min_base_height = 0.20  # [m], root height relative to the local ground below the pelvis
     walk_min_upright_projection = 0.20  # -projected_gravity_z; about 78.5 degrees tilt
 
     # ------------------------------------------------------------------
@@ -253,12 +270,12 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
 
     # ------------------------------------------------------------------
     # 表 V 三档扰动（每 body 独立进程）。力/矩幅值已按整机质量 ≈10kg / 论文 15.4kg
-    # （×0.65）缩放；短/小与长/小档幅值小，不缩放。头命令课程完成后，再用约
-    # 3000 iter 线性放开完整论文扰动，避免两种非平稳训练分布同时增强。
+    # （×0.65）缩放；短/小与长/小档幅值小，不缩放。按论文附录 A，从训练开始并在
+    # 前 1500 iter 线性放开完整扰动；1500 iter 只用于预览 nominal behavior，最终仍训 100k。
     # ------------------------------------------------------------------
     enable_paper_disturbance = True
-    disturbance_curriculum_delay_steps = 72_000
-    disturbance_curriculum_steps = 72_000
+    disturbance_curriculum_delay_steps = 0
+    disturbance_curriculum_steps = 36_000
     # 短/小：髋 + 脚
     dist_small_short_bodies = ("leg_r2_link", "leg_l2_link", "leg_r5_link", "leg_l5_link")
     dist_small_short_force_xy = (0.0, 5.0)  # [N]
@@ -323,7 +340,7 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
 
 @configclass
 class OceanisaaclabWalkRoughEnvCfg(OceanisaaclabWalkEnvCfg):
-    """Rough-terrain fine-tuning after the flat walking policy is stable."""
+    """Rough and mild-slope fine-tuning after the flat walking policy is stable."""
 
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 200,
@@ -335,6 +352,18 @@ class OceanisaaclabWalkRoughEnvCfg(OceanisaaclabWalkEnvCfg):
     )
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=2048, env_spacing=2.0, replicate_physics=True
+    )
+    # One downward ray follows the pelvis XY position. It is a training-only termination/
+    # diagnostic signal and is deliberately excluded from policy and critic observations.
+    terrain_height_scanner = RayCasterCfg(
+        prim_path="/World/envs/env_.*/Robot/Geometry/base_link",
+        update_period=0.02,
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 1.0)),
+        ray_alignment="yaw",
+        pattern_cfg=patterns.GridPatternCfg(resolution=1.0, size=(0.0, 0.0)),
+        mesh_prim_paths=["/World/ground"],
+        max_distance=3.0,
+        debug_vis=False,
     )
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
@@ -351,8 +380,8 @@ class OceanisaaclabWalkRoughEnvCfg(OceanisaaclabWalkEnvCfg):
         ),
         debug_vis=False,
     )
-    # Rough runner uses 96 control steps per iteration; preserve the same iteration schedule.
-    disturbance_curriculum_delay_steps = 288_000
-    disturbance_curriculum_steps = 288_000
+    # Rough/slope runner uses 96 control steps per iteration; preserve the paper's 1500-iteration ramp.
+    disturbance_curriculum_delay_steps = 0
+    disturbance_curriculum_steps = 144_000
     # Rough terrain is a fine-tuning stage entered after the flat walking curriculum.
     enable_contact_match_curriculum = False

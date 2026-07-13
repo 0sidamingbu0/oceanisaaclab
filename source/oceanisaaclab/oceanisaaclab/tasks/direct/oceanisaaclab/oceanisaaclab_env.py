@@ -13,6 +13,7 @@ from collections.abc import Sequence
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
+from isaaclab.sensors import RayCaster
 from isaaclab.utils.math import sample_uniform
 
 from .nested_contact_sensor import NestedBodyContactSensor
@@ -220,6 +221,10 @@ class OceanisaaclabEnv(DirectRLEnv):
                 self.cfg.torso_ground_contact_sensor
             )
             self.head_ground_contact_sensor = NestedBodyContactSensor(self.cfg.head_ground_contact_sensor)
+        terrain_height_scanner_cfg = getattr(self.cfg, "terrain_height_scanner", None)
+        self.terrain_height_scanner = (
+            RayCaster(terrain_height_scanner_cfg) if terrain_height_scanner_cfg is not None else None
+        )
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
@@ -236,6 +241,8 @@ class OceanisaaclabEnv(DirectRLEnv):
         if hasattr(self, "torso_ground_contact_sensor"):
             self.scene.sensors["torso_ground_contact_sensor"] = self.torso_ground_contact_sensor
             self.scene.sensors["head_ground_contact_sensor"] = self.head_ground_contact_sensor
+        if self.terrain_height_scanner is not None:
+            self.scene.sensors["terrain_height_scanner"] = self.terrain_height_scanner
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)

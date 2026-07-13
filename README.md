@@ -28,7 +28,7 @@
 |---|---|---|---|
 | `Ocean-BDX-Stand-Direct-v0` | 路线 A | 手工塑形奖励（速度跟踪 + 步态相位 + 稳定性等 20+ 项），观测 41 维 | `logs/rsl_rl/bdx_walk_phase/` |
 | `Ocean-BDX-Walk-Direct-v0` | 路线 B（行走预训练） | 论文 periodic 行走策略，平面 `8192×24` 高吞吐预训练，观测 80 维、动作 14 | `logs/rsl_rl/bdx_walk_imitation/` |
-| `Ocean-BDX-WalkRough-Direct-v0` | 路线 B（粗糙地形微调） | 与行走预训练相同接口，50% 平面 + 50% `±12mm` 连续粗糙面，`2048×96` | `logs/rsl_rl/bdx_walk_imitation/` |
+| `Ocean-BDX-WalkRough-Direct-v0` | 路线 B（粗糙/坡面微调） | 与行走预训练相同接口，40% 平面 + 30% `±12mm` 连续粗糙面 + 15% 上坡 + 15% 下坡（约 `0–5°`），`2048×96` | `logs/rsl_rl/bdx_walk_imitation/` |
 | `Ocean-BDX-StandPaper-Direct-v0` | 路线 B（站立） | **BDX 论文 perpetual 站立策略**（无相位，命令 g_perp=躯干4+头部4），policy/critic `77/79` 维、动作 14 | `logs/rsl_rl/bdx_stand_perpetual/` |
 
 本项目不装足底接触开关，观测里不含双足接触量（接触只用于奖励）。
@@ -65,7 +65,8 @@
   编码器/背隙/PD 增益每 episode 重采样；反射惯量在每个并行环境初始化时随机一次，避免
   高频跌倒 reset 时反复写 PhysX articulation 属性。
 - **扰动 = 论文表 V** 三档独立进程（髋/脚短小、盆骨长小、盆骨短大推力；大推力按整机
-  质量 ≈10/15.4 缩放为 58~97N），前 1500 iter 线性课程。
+  质量 ≈10/15.4 缩放为 58~97N），从训练开始、前 1500 iter 线性放满。有限 episode
+  reset 时从扰动周期随机相位进入，避免 `12-15s` 大推力静默期被 8 秒 episode 永久截断。
 - **相位速率 φ̇ 按命令从参考库插值**逐步积分，周期从零速 0.6s 连续缩短到满速
   0.48s；接触占空比 0.6，对应约 20% 双支撑窗口。
 - PPO/网络对齐论文表 IV：actor/critic 各 3×512 ELU、epoch 5、entropy 0、自适应
@@ -80,7 +81,14 @@
       --task Ocean-BDX-Walk-Direct-v0 --num_envs 8192 --max_iterations 100000 --headless
     ```
 
-- 第二阶段：当 `fall_rate` 已明显下降、步态成形后，从平面 checkpoint 进入粗糙地形微调：
+  `--max_iterations` 在 RSL-RL 的 `--resume` 模式下表示“额外训练多少 iteration”，不是
+  目标总 iteration。若要把 `model_N.pt` 严格续训到论文的总计 100,000 iter，应传
+  `--max_iterations $((100000-N))`；新扰动课程与旧 checkpoint 的训练分布不同，严格复现
+  优先从头训练。
+
+- 第二阶段：当 `fall_rate` 已明显下降、步态成形后，从平面 checkpoint 进入粗糙/坡面微调。
+  坡面从中心安全平台向外连续延伸，最大约 5°；单点地面射线只修正坡面上的终止高度，
+  不进入策略观测，因此平面 checkpoint 的 80 维接口保持兼容：
 
     ```bash
     ./_isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py \

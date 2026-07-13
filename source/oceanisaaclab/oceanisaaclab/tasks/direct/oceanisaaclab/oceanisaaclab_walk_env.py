@@ -21,7 +21,7 @@
    速度相关力矩限幅 + 背隙/速度相关噪声编码器读数 + 反射惯量随机化，全部
    每 episode 重采样。
 6. **扰动**（表 V）：三档独立进程（髋/脚短小扰动、盆骨长小扰动、盆骨短大推力），
-   基础步态等待阶段后线性放开。
+   从训练开始并在前 1500 iteration 线性放开。
 7. **相位**：φ̇ 从参考库按命令插值（步频随速度变化），逐步积分。
 """
 
@@ -100,8 +100,15 @@ class _DisturbanceSchedule:
         self.forces[env_ids] = 0.0
         self.torques[env_ids] = 0.0
         self.on_left[env_ids] = 0.0
+        # Enter each finite episode at a random phase of the paper's on/off process. Sampling
+        # a full 12-15 s large-push off interval here made that disturbance impossible in the
+        # 8 s walking episode. A residual delay over one mean cycle preserves the intended
+        # average event rate without synchronizing pushes at reset.
+        mean_cycle = 0.5 * (
+            self.on_s[0] + self.on_s[1] + self.off_s[0] + self.off_s[1]
+        )
         self.off_left[env_ids] = sample_uniform(
-            self.off_s[0], self.off_s[1], (len(env_ids), self.off_left.shape[1]), self.forces.device
+            0.0, mean_cycle, (len(env_ids), self.off_left.shape[1]), self.forces.device
         )
 
 
@@ -246,6 +253,12 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             wrench_shape = (self.num_envs, len(self._dist_body_ids), 3)
             self._dist_forces = torch.zeros(wrench_shape, device=self.device)
             self._dist_torques = torch.zeros(wrench_shape, device=self.device)
+            # The parent constructor performs its initial reset before these schedules exist.
+            # Initialize them explicitly so a resumed run does not push every environment on
+            # its first control step simply because the buffers were constructed at zero.
+            all_env_ids = torch.arange(self.num_envs, device=self.device)
+            for sched in self._disturbances:
+                sched.reset(all_env_ids)
 
         # ---- 非对称 critic 特权量（基类 DR 未开时回退到 1） ----
         if not hasattr(self, "_dr_mass_scale"):
@@ -682,6 +695,14 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
     # ------------------------------------------------------------------
     # dones: paper V-B ground-contact termination adapted to the nested URDF collision geometry
     # ------------------------------------------------------------------
+    def _local_ground_height(self) -> torch.Tensor:
+        """Return terrain height below the pelvis without exposing terrain to the policy."""
+        scanner = getattr(self, "terrain_height_scanner", None)
+        if scanner is None:
+            return self.scene.env_origins[:, 2]
+        ground_height = scanner.data.ray_hits_w.torch[:, 0, 2]
+        return torch.where(torch.isfinite(ground_height), ground_height, self.scene.env_origins[:, 2])
+
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # path frame 动力学每控制步推进一次（物理步进后、奖励/观测前）
         feet_center = self.robot.data.body_pos_w.torch[:, self._feet_body_ids, :2].mean(dim=1)
@@ -695,7 +716,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
             self._feet_heading_yaw(),
         )
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        base_height = self.robot.data.root_pos_w.torch[:, 2] - self.scene.env_origins[:, 2]
+        base_height = self.robot.data.root_pos_w.torch[:, 2] - self._local_ground_height()
         upright_projection = -self.robot.data.projected_gravity_b.torch[:, 2]
         terminated = (base_height < self.cfg.walk_min_base_height) | (
             upright_projection < self.cfg.walk_min_upright_projection
@@ -854,7 +875,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
         )
         foot_clearance = (
             self.robot.data.body_pos_w.torch[:, self._feet_body_ids, 2]
-            - self.scene.env_origins[:, 2].unsqueeze(1)
+            - self._local_ground_height().unsqueeze(1)
             - self.cfg.foot_origin_offset
         )
         ref_swing = 1.0 - ref_contact
