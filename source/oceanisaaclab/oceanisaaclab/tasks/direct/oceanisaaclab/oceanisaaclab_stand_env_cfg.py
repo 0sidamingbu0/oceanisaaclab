@@ -17,7 +17,8 @@
   p_pf2 + yaw_pf2 + projected_gravity3 + lin_vel3 + ang_vel3 + q_leg10 + q_neck4
   + qd_leg10 + qd_neck4 + a_{t-1}14 + a_{t-2}14 + g_perp8 = 77。
   critic + 摩擦 + 质量 = 79。
-- 参考 = 站立姿态库（scripts/gen_stand_pose.py，按躯干命令 4-DOF 插值腿角）+ 脖子头部映射。
+- 参考 = 站立姿态库（scripts/gen_stand_pose.py，head4+torso4 联合全身 CoM 平衡腿角）
+  + 同源脖子头部映射。
 - 奖励 = 静态姿态模仿：躯干位置/朝向 + 线/角速度→0 + 腿/脖子关节角模仿 + 双脚接触
   + 正则 + 存活。去掉行走的步态时序/参考速度跟踪。
 """
@@ -58,7 +59,7 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     # 躯干命令 g_perp 的 (h_torso, θ_torso) 部分：4-DOF 高度 + 朝向。
     # 范围须与 gen_stand_pose.py 网格一致（超范围会被采样器钳到边界）。
     # ------------------------------------------------------------------
-    # 对本机 5^4 完整网格做 IK 扫描后的可行域：最大脚位置残差 2.899 mm。
+    # 对本机 5^4 torso 网格做 IK 扫描后的可行域；联合 head 补偿由 stand_pose.npz 提供。
     torso_command_h_range = (-0.04, 0.01)  # [m] 躯干高度偏移（蹲下为负；升高受腿伸直限）
     torso_command_pitch_range = (-0.17, 0.17)  # [rad] 前后倾
     torso_command_yaw_range = (-0.24, 0.24)  # [rad] 原地偏航
@@ -108,14 +109,13 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     rew_w_survival = 20.0
 
     # ------------------------------------------------------------------
-    # 受扰恢复奖励门控。
-    # 稳态 gate=0 时严格使用上面的论文 Table I 权重；失衡后 gate 平滑升到 1，仅放松会
-    # 直接阻止抬脚的双脚接触、静态腿参考与腿动作平滑约束。躯干位姿/速度、存活、力矩和
-    # 关节加速度奖励始终保留，负责驱动策略通过跨步把身体带回稳定区。
-    # gate 只使用 policy 已观测且真机可靠可得的 path-frame 躯干位置、IMU 姿态/角速度、
-    # 状态估计水平速度和双脚接触。快速开启、慢速释放，避免摆动脚尚未落地就恢复强约束。
+    # 受扰恢复诊断（不参与奖励）。
+    # 论文对所有非 episodic policy 固定使用 Table I 权重，并明确指出去掉 leg imitation /
+    # contact 会造成 rapid foot shuffling。因此这里只用真机可获得的 torso/IMU/接触量标记
+    # 明显失稳窗口，统计捕获步；绝不根据该状态修改 contact、腿参考或动作平滑权重。
+    # 进入/退出使用 Schmitt 阈值，普通晃动保持 inactive；恢复期间单脚支撑会锁存状态，
+    # 双脚落地且重新稳定后再保持一小段时间，避免把同一次恢复拆成多个事件。
     # ------------------------------------------------------------------
-    enable_recovery_reward_gating = True
     recovery_tilt_error_start = 0.08  # [rad]
     recovery_tilt_error_full = 0.22  # [rad]
     recovery_lin_vel_start = 0.18  # [m/s]
@@ -124,20 +124,19 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     recovery_ang_vel_full = 1.40  # [rad/s]
     recovery_pos_error_start = 0.025  # [m], torso 相对参考支撑中心的平面偏移
     recovery_pos_error_full = 0.065  # [m]
-    recovery_activation_gate = 0.10
+    recovery_activation_severity = 0.35
+    recovery_deactivation_severity = 0.10
     recovery_command_grace_s = 0.35  # 命令重采样后暂不使用瞬时姿态误差触发
-    recovery_hold_s = 0.30  # 重新双脚着地后仍保持放松，允许落脚稳定
-    recovery_release_s = 0.40  # 保持结束后从当前 gate 线性释放到稳态权重
-    # 门控对奖励权重的作用随论文扰动课程同步从 0 放开到 1，避免随机初始策略在第一个
-    # update 就关闭双脚接触/强姿态模仿，先形成稳定站立基线再学习主动捕获步。
-    recovery_gate_curriculum_delay_steps = 0
-    recovery_gate_curriculum_steps = 36_000
-    recovery_contact_weight_scale = 0.0
-    recovery_rew_w_leg_joint_pos = -3.0
-    recovery_rew_w_action_rate = -0.25
-    recovery_rew_w_action_acc = -0.075
-    recovery_metric_gate_threshold = 0.10
+    recovery_hold_s = 0.30
+    recovery_capture_min_air_time_s = 0.12
+    recovery_capture_min_step_distance_m = 0.03
 
     # 论文站立扰动从训练开始用 1500 iteration（24 steps/iter）线性放开。
     disturbance_curriculum_delay_steps = 0
     disturbance_curriculum_steps = 36_000
+
+    # 训练分布：保留一部分完全无外力的 nominal episode，给策略稳定双支撑和锁脚
+    # 样本；其余 episode 使用完整 Table V 独立扰动过程。该采样不改变奖励，也不
+    # 改变扰动 episode 内的力/矩/开关时序，只避免小扰动几乎覆盖所有样本而诱发
+    # “无扰动也挪脚”的局部解。真机部署不使用该标志。
+    stand_disturbance_quiet_prob = 0.50

@@ -34,6 +34,7 @@ cfg.sim.device = args.device if args.device else "cuda:0"
 cfg.enable_paper_disturbance = False
 cfg.enable_obs_noise = False
 cfg.enable_action_latency = False
+cfg.stand_disturbance_quiet_prob = 1.0
 cfg.stand_zero_command_prob = 1.0
 cfg.stand_rsi_prob = 1.0
 cfg.torso_command_h_range = (0.0, 0.0)

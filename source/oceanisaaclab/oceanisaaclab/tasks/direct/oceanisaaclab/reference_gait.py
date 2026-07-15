@@ -221,9 +221,10 @@ class NeckHeadMap:
 class StandPose:
     """站立姿态参考的 torch 采样器（``scripts/gen_stand_pose.py`` 生成）。
 
-    perpetual 站立策略：躯干命令 4-DOF (h_torso 高度偏移, pitch, yaw, roll) → 10 个腿关节
-    参考角。无相位、脚不迈步（双脚固定地面）。头部脖子角由 NeckHeadMap 另行提供（解耦）。
-    四线性插值，纯张量、无循环。
+    perpetual 站立策略同时使用躯干命令 4-DOF 和头部命令 4-DOF。资产用 factorized
+    full-body CoM 表示避免 5^8 网格：torso 表给出 neutral-head 静态平衡姿态，head 表给出
+    全身 CoM 偏移，torso 节点雅可比把该偏移映射为腿角和躯干 xy 补偿。旧 4D 资产仍可加载，
+    此时 head 参数被忽略。
     """
 
     def __init__(self, npz_path: str, device: str | torch.device):
@@ -258,6 +259,54 @@ class StandPose:
             if "foot_yaw_neutral" in data.files
             else torch.tensor([torch.pi, 0.0], dtype=torch.float32, device=self.device)
         )
+        balance_fields = {
+            "head_dh_grid",
+            "head_pitch_grid",
+            "head_yaw_grid",
+            "head_roll_grid",
+            "head_com_offset_b",
+            "head_joint_pos_jac",
+            "head_base_pos_pf_jac",
+        }
+        self.has_head_balance = balance_fields.issubset(data.files)
+        if self.has_head_balance:
+            self.head_h_grid = tensor("head_dh_grid")
+            self.head_pitch_grid = tensor("head_pitch_grid")
+            self.head_yaw_grid = tensor("head_yaw_grid")
+            self.head_roll_grid = tensor("head_roll_grid")
+            self.head_com_offset_b = tensor("head_com_offset_b")
+            self.head_joint_pos_jac = tensor("head_joint_pos_jac")
+            self.head_base_pos_pf_jac = tensor("head_base_pos_pf_jac")
+        else:
+            self.head_h_grid = None
+            self.head_pitch_grid = None
+            self.head_yaw_grid = None
+            self.head_roll_grid = None
+            self.head_com_offset_b = None
+            self.head_joint_pos_jac = None
+            self.head_base_pos_pf_jac = None
+        self.balance_method = (
+            str(data["balance_method"].item())
+            if "balance_method" in data.files
+            else "torso_only_legacy"
+        )
+        self.balance_target_xy = (
+            tensor("balance_target_xy") if "balance_target_xy" in data.files else None
+        )
+        self.sole_support_center_b = (
+            tensor("sole_support_center_b")
+            if "sole_support_center_b" in data.files
+            else None
+        )
+        packed_tables = [self.joint_pos, self.base_pos_pf, self.base_yaw_pf.unsqueeze(-1)]
+        if self.has_head_balance:
+            packed_tables.extend(
+                (
+                    self.head_joint_pos_jac.flatten(start_dim=-2),
+                    self.head_base_pos_pf_jac.flatten(start_dim=-2),
+                )
+            )
+        self._packed_reference = torch.cat(packed_tables, dim=-1)
 
     def _sample_table(self, torso_cmd: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
         ih0, ih1, wh = ReferenceGait._grid_coords(torso_cmd[:, 0], self.h_grid)
@@ -269,19 +318,66 @@ class StandPose:
             for cp, fp in ((ip0, 1.0 - wp), (ip1, wp)):
                 for cy, fy in ((iy0, 1.0 - wy), (iy1, wy)):
                     for cr, fr in ((ir0, 1.0 - wr), (ir1, wr)):
-                        weight = (fh * fp * fy * fr).unsqueeze(-1)
                         corner = table[ch, cp, cy, cr]
+                        weight = fh * fp * fy * fr
+                        weight = weight.reshape((weight.shape[0],) + (1,) * (corner.ndim - 1))
                         out = corner * weight if out is None else out + corner * weight
         return out
 
-    def sample(self, torso_cmd: torch.Tensor) -> torch.Tensor:
-        """按躯干命令 (N,4)=(h_torso, pitch, yaw, roll) 四线性插值返回腿关节角 (N,10)。"""
-        return self._sample_table(torso_cmd, self.joint_pos)
+    def _sample_head_table(self, head_cmd: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+        ih0, ih1, wh = ReferenceGait._grid_coords(head_cmd[:, 0], self.head_h_grid)
+        ip0, ip1, wp = ReferenceGait._grid_coords(head_cmd[:, 1], self.head_pitch_grid)
+        iy0, iy1, wy = ReferenceGait._grid_coords(head_cmd[:, 2], self.head_yaw_grid)
+        ir0, ir1, wr = ReferenceGait._grid_coords(head_cmd[:, 3], self.head_roll_grid)
+        out = None
+        for ch, fh in ((ih0, 1.0 - wh), (ih1, wh)):
+            for cp, fp in ((ip0, 1.0 - wp), (ip1, wp)):
+                for cy, fy in ((iy0, 1.0 - wy), (iy1, wy)):
+                    for cr, fr in ((ir0, 1.0 - wr), (ir1, wr)):
+                        corner = table[ch, cp, cy, cr]
+                        weight = fh * fp * fy * fr
+                        weight = weight.reshape((weight.shape[0],) + (1,) * (corner.ndim - 1))
+                        out = corner * weight if out is None else out + corner * weight
+        return out
 
-    def sample_base_pos_pf(self, torso_cmd: torch.Tensor) -> torch.Tensor:
-        """返回生成器定义的躯干 path-frame xy 参考；它不是估算或伪造的 CoP。"""
-        return self._sample_table(torso_cmd, self.base_pos_pf)
+    def sample_reference(
+        self, torso_cmd: torch.Tensor, head_cmd: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
+        """Sample the joint/base reference for the coupled torso4/head4 command."""
+        packed = self._sample_table(torso_cmd, self._packed_reference)
+        joint_pos = packed[:, :10]
+        base_pos_pf = packed[:, 10:12]
+        base_yaw_pf = packed[:, 12]
+        if head_cmd is not None and self.has_head_balance:
+            head_com_offset = self._sample_head_table(head_cmd, self.head_com_offset_b)
+            joint_jac = packed[:, 13:43].reshape(-1, 10, 3)
+            base_jac = packed[:, 43:49].reshape(-1, 2, 3)
+            joint_pos = joint_pos + torch.einsum(
+                "nij,nj->ni", joint_jac, head_com_offset
+            )
+            base_pos_pf = base_pos_pf + torch.einsum(
+                "nij,nj->ni", base_jac, head_com_offset
+            )
+        return {
+            "joint_pos": joint_pos,
+            "base_pos_pf": base_pos_pf,
+            "base_yaw_pf": base_yaw_pf,
+        }
 
-    def sample_base_yaw_pf(self, torso_cmd: torch.Tensor) -> torch.Tensor:
+    def sample(
+        self, torso_cmd: torch.Tensor, head_cmd: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """按联合 torso4/head4 命令返回腿关节角；省略 head 时保持旧接口语义。"""
+        return self.sample_reference(torso_cmd, head_cmd)["joint_pos"]
+
+    def sample_base_pos_pf(
+        self, torso_cmd: torch.Tensor, head_cmd: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """返回联合姿态的躯干 path-frame xy 静态平衡参考。"""
+        return self.sample_reference(torso_cmd, head_cmd)["base_pos_pf"]
+
+    def sample_base_yaw_pf(
+        self, torso_cmd: torch.Tensor, head_cmd: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """返回 solved torso/head yaw 相对双脚平均 heading 的参考角。"""
-        return self._sample_table(torso_cmd, self.base_yaw_pf.unsqueeze(-1)).squeeze(-1)
+        return self.sample_reference(torso_cmd, head_cmd)["base_yaw_pf"]

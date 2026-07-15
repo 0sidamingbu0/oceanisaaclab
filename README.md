@@ -124,28 +124,28 @@
 - **共享零速姿态**：`stand_pose.npz` 的精确零命令、行走参考库零速帧和 URDF q=0 使用同一
   腿角、base height 与双脚锚点：`q_leg=0`、`base_height=0.38498640060424805m`、
   `base_pos_pf=[0.04638837,-0.00091510]m`。环境启动时会检查三者一致，避免两策略零速脚距
-  或躯干参考不同。新 `5^4` 参考库最坏脚位置残差为 `2.899mm`，动作映射和软限位夹持数为 0。
+  或躯干参考不同。联合参考的 neutral-head torso 网格脚残差最大约 `0.886mm`，叠加完整 head
+  角点的 factorized 近似最大约 `4.220mm`；动作映射和软限位夹持数为 0。
 - **奖励 = 论文 Table I**：躯干 path 系 xy/orientation、线·角速度、腿/脖子关节角和速度、
   双脚接触、全 14 关节力矩/关节加速度、动作平滑及 survival。`torso_pos` 核恢复为 200、
   orientation 权重恢复为 1、survival 恢复为 20；躯干高度通过站立腿参考表达，不再添加
   论文之外的独立 height reward。
-- **受扰恢复门控**：稳定时严格使用上述 Table I 权重；相对命令姿态的 roll/pitch 倾斜误差、
-  body 水平速度、roll/pitch 角速度或 path-frame torso 平面偏移升高时，只放松既有的双脚接触、
-  腿姿态模仿和腿动作平滑约束。命令重采样后 `0.35s` 只忽略瞬时 tilt error；速度、角速度和
-  位置误差仍可触发。stand_pose 全命令域的 `base_pos_pf` 相对 neutral 最多只变 `1.70mm`，远低于
-  position gate 的 `25mm` 起点，因此保留位置触发不会误判命令跳变，也避免慢速平移失稳盲区。
-  门控快速开启、单脚支撑期间保持，恢复双支撑后再保持 `0.30s`，随后按
-  `0.40s` 满量程慢释放；其奖励作用与论文扰动同步在前 1500 iteration / 36000 steps 从 0 放到
-  1，避免随机初始策略立即关闭稳站约束。躯干/速度/survival/力矩/关节加速度目标始终保留；
-  没有新增脚高、指定摆动脚或迈步奖励，也没有硬编码恢复脚序。
+- **受扰恢复（仅诊断）**：奖励始终严格使用论文 Table I。论文明确指出，去掉腿姿态、腿速度或接触约束
+  会导致策略快速挪脚，因此恢复状态不再缩放 contact、leg imitation 或动作平滑权重。环境只用
+  真机可得的 IMU、状态估计速度、path-frame 位置和脚接触计算 Schmitt 诊断状态：失稳信号达到
+  `0.35` 才标记恢复，低于 `0.10` 且双脚稳定 `0.30s` 后退出。该状态不进入奖励、不改变动作，
+  也没有新增脚高、指定左右摆动脚或迈步奖励；捕获步仍由 Table V 大扰动下的存活与躯干模仿收益自行学出。
 - **站立 RSI**：50% episode 使用 torso/head 全零的共享 neutral 状态；其余覆盖完整姿态命令。
   `stand_rsi_prob=0.8` 时从命令对应参考出生，其余从 neutral 学习过渡。q、FOH/LPF 目标、
   延迟环和前两帧动作全部初始化为同一个 14 维 setpoint，不再残留 walking RSI 动作。
+- **训练样本分层**：默认 50% episode 完全关闭外力作为 nominal 双支撑基线，另外 50% 保持完整
+  Table V 扰动过程。该比例只用于训练分布，不进入观测、不改变奖励；用
+  `clean_liftoff_events_per_episode` 和 `clean_double_support_rate` 验收无扰时锁脚。
 - **path frame**：站立分支收敛到双脚中心和消除左右 link-frame 偏置后的双脚平均 heading，
   不是收敛到躯干 yaw；行走和站立使用同一份 path-frame 状态。
 - **动作与频率**：14 维动作与行走完全同构，50Hz policy / 200Hz low-level，腿和脖子目标都
-  经过 FOH + 37.5Hz 低通。为让满强度扰动出现后仍保留跨步探索，Stand PPO 使用
-  `entropy_coef=0.001`、`min_std=0.05`，其余网络/算法参数沿用现有论文适配配置。
+  经过 FOH + 37.5Hz 低通。Stand PPO 恢复论文附录 A 的 `entropy_coef=0` 和默认动作方差下限；
+  扰动本身提供恢复探索，避免长期随机腿抖动。
 
     ```bash
     # 训练（与行走各训各的，运行时按需切换策略）
@@ -157,12 +157,12 @@
       --checkpoint logs/rsl_rl/bdx_stand_perpetual/<run>/model_<iter>.pt
     ```
 
-旧 `74/76` 维站立 checkpoint 和 ONNX 在形状上不兼容；此前的 77 维站立模型虽然形状匹配，
-但只见过约 1/3 head 域，也没有当前受扰门控与探索分布，不能 resume 后当作本配置结果，更
-不能直接接收完整 head 命令。必须从头训练并重新导出，再同步替换 OceanBDX 的
-`policy/stand/policy.onnx[.data]`。训练时重点监控 raw `Metrics/recovery_signal_mean`、有效
-`Metrics/recovery_gate_mean`、`Curriculum/recovery_gate_scale`、恢复期单脚支撑/liftoff/
-touchdown、落脚距离和 `fall_rate`。完整接口与迁移检查见
+旧 `74/76` 维站立 checkpoint 和 ONNX 在形状上不兼容；当前 77 维模型也不能续训，因为旧版
+恢复门控曾把 contact/腿姿态约束长期关闭，已学成小碎步局部解。必须从头训练并重新导出，再同步替换 OceanBDX 的
+`policy/stand/policy.onnx[.data]`。训练时重点监控 `Metrics/recovery_signal_mean`、
+`Metrics/recovery_active_rate`、`Metrics/recovery_capture_steps_per_episode`、
+`Metrics/quiet_liftoff_events_per_episode`、`Metrics/quiet_foot_drift_cm`、恢复期 touchdown
+落脚距离和 `fall_rate`。完整接口与迁移检查见
 [`BDX_STAND_TRAINING.md`](source/oceanisaaclab/docs/BDX_STAND_TRAINING.md)。
 
 运行时切换必须遵循论文 Fig.9：两策略共享最近两帧**实际归一化动作**、path frame 以及腿/脖子
@@ -246,7 +246,8 @@ meshcat（打开日志里打印的 `http://127.0.0.1:7000/static/` 观看）。
     ```
 
 - **脖子/头部映射库** `neck_head_map.npz`（头部命令 4-DOF：Δh 头高 / pitch 点头 / yaw 摇头 /
-  roll 歪头 → 4 个脖子关节参考角。脚与脖子 IK 解耦，头部命令不进步态库网格）：
+  roll 歪头 → 4 个脖子关节参考角。脖子运动学单独求解；站立库会进一步使用其全身 CoM
+  偏移生成腿部平衡补偿）：
 
     ```bash
     python3 scripts/gen_neck_head_map.py             # 生成 assets/gaits/neck_head_map.npz
@@ -254,13 +255,13 @@ meshcat（打开日志里打印的 `http://127.0.0.1:7000/static/` 观看）。
     python3 scripts/gen_neck_head_map.py --viz       # 生成 + 扫掠可视化
     ```
 
-- **站立姿态库** `stand_pose.npz`（站立策略用；躯干命令 4-DOF：h 高度 / pitch / yaw / roll →
-  10 个腿关节角及 path-frame 躯干参考，双脚固定地面；精确零命令强制等于行走零速 q=0
-  公共切换姿态）：
+- **站立姿态库** `stand_pose.npz`（站立策略用；同时输入 torso4 + head4，使用 625 个 torso
+  静态平衡节点、625 个 head 全身 CoM 偏移节点和局部 IK 雅可比生成 10 个腿关节角及
+  path-frame 躯干参考。双脚固定地面；精确零命令仍等于行走零速 q=0 公共切换姿态）：
 
     ```bash
     python3 scripts/gen_stand_pose.py                # 生成 assets/gaits/stand_pose.npz
-    python3 scripts/gen_stand_pose.py --viz-only     # meshcat 逐轴扫掠(双脚固定,只动躯干姿态)
+    python3 scripts/gen_stand_pose.py --viz-only     # 播放已保存资产，逐轴扫掠 torso4 + head4
     python3 scripts/gen_stand_pose.py --viz          # 生成 + 扫掠可视化
     ```
 
