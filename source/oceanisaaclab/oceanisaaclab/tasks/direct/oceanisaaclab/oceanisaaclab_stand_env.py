@@ -6,8 +6,9 @@
 """路线 B（BDX 论文复刻）站立（perpetual）训练环境。
 
 论文 divide-and-conquer：periodic 行走策略之外单独训练 perpetual 站立策略
-π(a | s, g_perp)，**无相位**、脚不迈步，命令 g_perp = (Δh_head, Δθ_head, h_torso,
-θ_torso)（式 5）。继承行走环境 OceanisaaclabWalkEnv，复用附录 B 执行器模型、表 V 扰动、
+π(a | s, g_perp)，**无相位**，命令 g_perp = (Δh_head, Δθ_head, h_torso,
+θ_torso)（式 5）。静态参考保持双脚支撑，但受扰时允许策略偏离参考并跨步恢复。继承行走环境
+OceanisaaclabWalkEnv，复用附录 B 执行器模型、表 V 扰动、
 域随机化、torso 等效触地终止、非对称 critic、path frame、脖子位置伺服、脖子/头部命令映射；
 覆盖：观测（去相位谐波、命令换 torso4+head4）、奖励（静态姿态模仿）、reset（站立命令
 采样 + 从标称站姿出生）。行走的动作管线 / 执行器模型 / 脖子通路完全沿用。
@@ -75,6 +76,9 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         self._torso_command_scale = torch.tensor(
             self.cfg.torso_command_scale, dtype=torch.float, device=self.device
         ).unsqueeze(0)
+        self._stand_command_grace_left = torch.zeros(self.num_envs, device=self.device)
+        self._recovery_gate_state = torch.zeros(self.num_envs, device=self.device)
+        self._recovery_hold_left = torch.zeros(self.num_envs, device=self.device)
         # 覆盖奖励分项统计：换成论文站立项集合，去掉 gait 与额外 height 项。
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
@@ -99,6 +103,29 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
                 "survival",
             ]
         }
+        # Stand-specific diagnostics. Parent contact/action metrics are also updated below so
+        # their TensorBoard series no longer stay at a misleading constant zero.
+        self._stand_metric_steps = torch.zeros(self.num_envs, device=self.device)
+        self._metric_recovery_signal = torch.zeros(self.num_envs, device=self.device)
+        self._metric_recovery_gate = torch.zeros(self.num_envs, device=self.device)
+        self._metric_recovery_steps = torch.zeros(self.num_envs, device=self.device)
+        self._metric_recovery_single_support = torch.zeros(self.num_envs, device=self.device)
+        self._metric_liftoff_events = torch.zeros(self.num_envs, device=self.device)
+        self._metric_recovery_liftoff_events = torch.zeros(self.num_envs, device=self.device)
+        self._metric_touchdown_events = torch.zeros(self.num_envs, device=self.device)
+        self._metric_touchdown_step_distance = torch.zeros(self.num_envs, device=self.device)
+        self._metric_recovery_touchdown_events = torch.zeros(self.num_envs, device=self.device)
+        self._metric_recovery_touchdown_step_distance = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self._stand_previous_contact = torch.ones(self.num_envs, 2, device=self.device)
+        self._stand_foot_airborne = torch.zeros(
+            self.num_envs, 2, dtype=torch.bool, device=self.device
+        )
+        self._stand_liftoff_xy = torch.zeros(self.num_envs, 2, 2, device=self.device)
+        self._stand_liftoff_recovery = torch.zeros(
+            self.num_envs, 2, dtype=torch.bool, device=self.device
+        )
 
     # ------------------------------------------------------------------
     # observations: 论文式 (8) 状态 + g_perp（无相位；命令 = torso4 + head4）
@@ -176,6 +203,97 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
     # ------------------------------------------------------------------
     # rewards: 静态姿态模仿（躯干位姿 + 速度→0 + 腿/脖子模仿 + 双脚接触 + 正则）
     # ------------------------------------------------------------------
+    @staticmethod
+    def _linear_recovery_gate(value: torch.Tensor, start: float, full: float) -> torch.Tensor:
+        """Map a physical instability measure to a smooth [0, 1] recovery weight."""
+        return torch.clamp((value - start) / max(full - start, 1.0e-6), 0.0, 1.0)
+
+    def _recovery_gate_curriculum_scale(self) -> float:
+        elapsed = max(
+            0,
+            self._walk_curriculum_steps()
+            - self.cfg.recovery_gate_curriculum_delay_steps,
+        )
+        return min(1.0, elapsed / float(self.cfg.recovery_gate_curriculum_steps))
+
+    def _recovery_gate(
+        self,
+        projected_gravity: torch.Tensor,
+        lin_vel: torch.Tensor,
+        ang_vel: torch.Tensor,
+        pitch_cmd: torch.Tensor,
+        roll_cmd: torch.Tensor,
+        planar_error: torch.Tensor,
+        in_contact: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.cfg.enable_recovery_reward_gating:
+            return torch.zeros(self.num_envs, device=self.device)
+
+        # Gravity expressed in the desired torso frame. Yaw does not change gravity, so a
+        # commanded yaw pose cannot accidentally enable recovery-mode reward weights.
+        cos_pitch = torch.cos(pitch_cmd)
+        desired_gravity = torch.stack(
+            (
+                torch.sin(pitch_cmd),
+                -torch.sin(roll_cmd) * cos_pitch,
+                -torch.cos(roll_cmd) * cos_pitch,
+            ),
+            dim=1,
+        )
+        gravity_cos = torch.sum(projected_gravity * desired_gravity, dim=1).clamp(-1.0, 1.0)
+        tilt_error = torch.acos(gravity_cos)
+        horizontal_speed = torch.linalg.vector_norm(lin_vel[:, :2], dim=1)
+        tilt_rate = torch.linalg.vector_norm(ang_vel[:, :2], dim=1)
+
+        tilt_gate = self._linear_recovery_gate(
+            tilt_error, self.cfg.recovery_tilt_error_start, self.cfg.recovery_tilt_error_full
+        )
+        velocity_gate = self._linear_recovery_gate(
+            horizontal_speed, self.cfg.recovery_lin_vel_start, self.cfg.recovery_lin_vel_full
+        )
+        angular_gate = self._linear_recovery_gate(
+            tilt_rate, self.cfg.recovery_ang_vel_start, self.cfg.recovery_ang_vel_full
+        )
+        position_gate = self._linear_recovery_gate(
+            planar_error, self.cfg.recovery_pos_error_start, self.cfg.recovery_pos_error_full
+        )
+
+        # A new posture command changes the desired orientation instantaneously. Do not mistake
+        # that reference jump for a physical push. The planar reference moves by less than 2 mm
+        # over the full stand-pose grid, so position error remains a valid recovery signal here.
+        command_grace = self._stand_command_grace_left > 0.0
+        tilt_gate = torch.where(command_grace, torch.zeros_like(tilt_gate), tilt_gate)
+        instant_gate = torch.maximum(
+            torch.maximum(tilt_gate, velocity_gate),
+            torch.maximum(angular_gate, position_gate),
+        )
+
+        # Fast attack, contact-aware hold, slow release. Once a recovery step begins, the strong
+        # static-reference/contact weights must not return while a foot is still in the air.
+        double_support = torch.sum(in_contact, dim=1) > 1.5
+        triggered = instant_gate > self.cfg.recovery_activation_gate
+        recovery_in_progress = (
+            self._recovery_gate_state > self.cfg.recovery_metric_gate_threshold
+        ) & ~double_support
+        refresh_hold = triggered | recovery_in_progress
+        hold_duration = torch.full_like(self._recovery_hold_left, self.cfg.recovery_hold_s)
+        self._recovery_hold_left = torch.where(
+            refresh_hold,
+            hold_duration,
+            torch.clamp(self._recovery_hold_left - self.step_dt, min=0.0),
+        )
+        release_step = self.step_dt / max(self.cfg.recovery_release_s, self.step_dt)
+        decayed_gate = torch.clamp(self._recovery_gate_state - release_step, min=0.0)
+        retained_gate = torch.where(
+            self._recovery_hold_left > 0.0,
+            self._recovery_gate_state,
+            decayed_gate,
+        )
+        recovery_gate = torch.maximum(instant_gate, retained_gate)
+        self._recovery_gate_state.copy_(recovery_gate)
+        self._stand_command_grace_left.sub_(self.step_dt).clamp_(min=0.0)
+        return recovery_gate
+
     def _get_rewards(self) -> torch.Tensor:
         cfg = self.cfg
         ref_leg = self._stand_pose.sample(self._torso_commands)  # (N,10) 站立腿角
@@ -186,6 +304,7 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         base_xy = self.robot.data.root_pos_w.torch[:, :2]
         head_yaw = self._head_yaw()
         pos_pf, _ = self._path_frame.base_in_path_frame(base_xy, head_yaw)
+        planar_error = torch.linalg.vector_norm(pos_pf - ref_base_pos_pf, dim=1)
         lin_vel = self.robot.data.root_lin_vel_b.torch
         ang_vel = self.robot.data.root_ang_vel_b.torch
         joint_pos = self.robot.data.joint_pos.torch[:, self._leg_dof_idx]
@@ -199,10 +318,33 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         # 命令：躯干 (h, pitch, yaw, roll)
         pitch_cmd = self._torso_commands[:, 1]
         roll_cmd = self._torso_commands[:, 3]
+        projected_gravity = self.robot.data.projected_gravity_b.torch
+        recovery_signal = self._recovery_gate(
+            projected_gravity,
+            lin_vel,
+            ang_vel,
+            pitch_cmd,
+            roll_cmd,
+            planar_error,
+            in_contact,
+        )
+        recovery_gate = recovery_signal * self._recovery_gate_curriculum_scale()
+        leg_joint_pos_weight = cfg.rew_w_leg_joint_pos + recovery_gate * (
+            cfg.recovery_rew_w_leg_joint_pos - cfg.rew_w_leg_joint_pos
+        )
+        action_rate_weight = cfg.rew_w_action_rate + recovery_gate * (
+            cfg.recovery_rew_w_action_rate - cfg.rew_w_action_rate
+        )
+        action_acc_weight = cfg.rew_w_action_acc + recovery_gate * (
+            cfg.recovery_rew_w_action_acc - cfg.rew_w_action_acc
+        )
+        contact_weight_scale = 1.0 - recovery_gate * (
+            1.0 - cfg.recovery_contact_weight_scale
+        )
 
         # 1) 躯干 path 系 xy：跟随离线运动学参考。q=0 时躯干相对双脚
         # link 原点中心保留真实前向偏移，不能强制成 path-frame 原点。
-        pos_err = torch.sum(torch.square(pos_pf - ref_base_pos_pf), dim=1)
+        pos_err = torch.square(planar_error)
         rew_pos_xy = cfg.rew_w_torso_pos_xy * torch.exp(-cfg.rew_k_torso_pos_xy * pos_err)
         # 2) 躯干朝向跟可实现 reference state：yaw 是 torso/head 相对 solved
         # 双脚平均 heading，语义与 walking reference 的 base_yaw_pf 一致。
@@ -217,10 +359,12 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         rew_ang_xy = cfg.rew_w_ang_vel_xy * torch.exp(-cfg.rew_k_ang_vel * torch.sum(torch.square(ang_vel[:, :2]), dim=1))
         rew_ang_z = cfg.rew_w_ang_vel_z * torch.exp(-cfg.rew_k_ang_vel * torch.square(ang_vel[:, 2]))
         # 5) 腿关节角模仿站立参考 / 关节速度 → 0
-        rew_joint_pos = cfg.rew_w_leg_joint_pos * torch.sum(torch.square(joint_pos - ref_leg), dim=1)
+        rew_joint_pos = leg_joint_pos_weight * torch.sum(torch.square(joint_pos - ref_leg), dim=1)
         rew_joint_vel = cfg.rew_w_leg_joint_vel * torch.sum(torch.square(joint_vel), dim=1)
         # 6) 双脚接触（站立参考接触恒 [1,1]）
-        rew_contact = cfg.rew_w_contact_match * torch.sum(in_contact, dim=1)
+        rew_contact = (
+            cfg.rew_w_contact_match * contact_weight_scale * torch.sum(in_contact, dim=1)
+        )
         # 7) 正则：力矩 / 关节加速度 / 腿动作率 / 腿动作加速度
         neck_torque = self.robot.data.applied_torque.torch[:, self._neck_dof_idx]
         rew_torque = cfg.rew_w_torque * (
@@ -231,11 +375,11 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
             torch.sum(torch.square(joint_acc), dim=1)
             + torch.sum(torch.square(neck_joint_acc), dim=1)
         )
-        rew_action_rate = cfg.rew_w_action_rate * torch.sum(
+        rew_action_rate = action_rate_weight * torch.sum(
             torch.square(self._actions[:, self._leg_action_slice]
                          - self._previous_actions[:, self._leg_action_slice]), dim=1
         )
-        rew_action_acc = cfg.rew_w_action_acc * torch.sum(
+        rew_action_acc = action_acc_weight * torch.sum(
             torch.square(self._actions[:, self._leg_action_slice]
                          - 2.0 * self._previous_actions[:, self._leg_action_slice]
                          + self._prev_prev_actions[:, self._leg_action_slice]), dim=1
@@ -278,6 +422,66 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         total_reward = torch.stack(list(reward_terms.values()), dim=0).sum(dim=0) * self.step_dt
         for key, value in reward_terms.items():
             self._episode_sums[key] += value * self.step_dt
+
+        # Parent metrics are allocated by OceanisaaclabWalkEnv but its reward function is not
+        # called in this subclass. Update their physical equivalents here.
+        self._metric_left_contact += in_contact[:, 1]
+        self._metric_right_contact += in_contact[:, 0]
+        self._metric_double_support += torch.prod(in_contact, dim=1)
+        self._metric_steps += 1.0
+        self._metric_vel_error += torch.linalg.vector_norm(lin_vel[:, :2], dim=1)
+        self._metric_yaw_error += torch.abs(ang_vel[:, 2])
+        self._metric_neck_tracking_sq += torch.mean(
+            torch.square(neck_joint_pos - neck_ref), dim=1
+        )
+
+        contact_count = torch.sum(in_contact, dim=1)
+        single_support = (contact_count == 1.0).float()
+        recovery_active = recovery_gate > cfg.recovery_metric_gate_threshold
+        liftoff = (self._stand_previous_contact > 0.5) & (in_contact < 0.5)
+        touchdown = (
+            (self._stand_previous_contact < 0.5)
+            & (in_contact > 0.5)
+            & self._stand_foot_airborne
+        )
+        liftoff_count = torch.sum(liftoff.float(), dim=1)
+        foot_xy = self.robot.data.body_pos_w.torch[:, self._feet_body_ids, :2]
+        self._stand_liftoff_xy = torch.where(
+            liftoff.unsqueeze(-1), foot_xy, self._stand_liftoff_xy
+        )
+        self._stand_liftoff_recovery = torch.where(
+            liftoff,
+            recovery_active.unsqueeze(1).expand_as(liftoff),
+            self._stand_liftoff_recovery,
+        )
+        touchdown_distance = torch.linalg.vector_norm(
+            foot_xy - self._stand_liftoff_xy, dim=2
+        )
+        recovery_touchdown = touchdown & (
+            self._stand_liftoff_recovery
+            | recovery_active.unsqueeze(1).expand_as(touchdown)
+        )
+        self._stand_metric_steps += 1.0
+        self._metric_recovery_signal += recovery_signal
+        self._metric_recovery_gate += recovery_gate
+        self._metric_recovery_steps += recovery_active.float()
+        self._metric_recovery_single_support += single_support * recovery_active.float()
+        self._metric_liftoff_events += liftoff_count
+        self._metric_recovery_liftoff_events += liftoff_count * recovery_active.float()
+        self._metric_touchdown_events += torch.sum(touchdown.float(), dim=1)
+        self._metric_touchdown_step_distance += torch.sum(
+            touchdown_distance * touchdown.float(), dim=1
+        )
+        self._metric_recovery_touchdown_events += torch.sum(
+            recovery_touchdown.float(), dim=1
+        )
+        self._metric_recovery_touchdown_step_distance += torch.sum(
+            touchdown_distance * recovery_touchdown.float(), dim=1
+        )
+        self._stand_foot_airborne |= liftoff
+        self._stand_foot_airborne &= ~touchdown
+        self._stand_liftoff_recovery &= ~touchdown
+        self._stand_previous_contact.copy_(in_contact)
         return total_reward
 
     # ------------------------------------------------------------------
@@ -318,6 +522,7 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         self._control_resample_left[env_ids] = self._sample_range(
             self.cfg.control_resample_interval_s, (n,)
         )
+        self._stand_command_grace_left[env_ids] = self.cfg.recovery_command_grace_s
         return zero
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
@@ -330,6 +535,67 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         super()._reset_idx(env_ids)
         if not hasattr(self, "_stand_pose"):
             return  # 父类构造期首次 reset：本类缓冲尚未建立
+
+        metric_steps = self._stand_metric_steps[env_ids].clamp_min(1.0)
+        log = self.extras.setdefault("log", {})
+        log["Metrics/recovery_signal_mean"] = torch.mean(
+            self._metric_recovery_signal[env_ids] / metric_steps
+        )
+        log["Metrics/recovery_gate_mean"] = torch.mean(
+            self._metric_recovery_gate[env_ids] / metric_steps
+        )
+        log["Metrics/recovery_active_rate"] = torch.mean(
+            self._metric_recovery_steps[env_ids] / metric_steps
+        )
+        log["Metrics/recovery_single_support_rate"] = (
+            self._metric_recovery_single_support[env_ids].sum()
+            / self._metric_recovery_steps[env_ids].sum().clamp_min(1.0)
+        )
+        log["Metrics/liftoff_events_per_episode"] = torch.mean(
+            self._metric_liftoff_events[env_ids]
+        )
+        log["Metrics/recovery_liftoff_events_per_episode"] = torch.mean(
+            self._metric_recovery_liftoff_events[env_ids]
+        )
+        touchdown_events = self._metric_touchdown_events[env_ids].sum().clamp_min(1.0)
+        recovery_touchdown_events = self._metric_recovery_touchdown_events[
+            env_ids
+        ].sum().clamp_min(1.0)
+        log["Metrics/touchdown_events_per_episode"] = torch.mean(
+            self._metric_touchdown_events[env_ids]
+        )
+        log["Metrics/touchdown_step_distance_cm"] = (
+            100.0 * self._metric_touchdown_step_distance[env_ids].sum() / touchdown_events
+        )
+        log["Metrics/recovery_touchdown_events_per_episode"] = torch.mean(
+            self._metric_recovery_touchdown_events[env_ids]
+        )
+        log["Metrics/recovery_touchdown_step_distance_cm"] = (
+            100.0
+            * self._metric_recovery_touchdown_step_distance[env_ids].sum()
+            / recovery_touchdown_events
+        )
+        log["Curriculum/recovery_gate_scale"] = self._recovery_gate_curriculum_scale()
+        for metric in (
+            self._stand_metric_steps,
+            self._metric_recovery_signal,
+            self._metric_recovery_gate,
+            self._metric_recovery_steps,
+            self._metric_recovery_single_support,
+            self._metric_liftoff_events,
+            self._metric_recovery_liftoff_events,
+            self._metric_touchdown_events,
+            self._metric_touchdown_step_distance,
+            self._metric_recovery_touchdown_events,
+            self._metric_recovery_touchdown_step_distance,
+        ):
+            metric[env_ids] = 0.0
+        self._stand_previous_contact[env_ids] = 1.0
+        self._stand_foot_airborne[env_ids] = False
+        self._stand_liftoff_xy[env_ids] = 0.0
+        self._stand_liftoff_recovery[env_ids] = False
+        self._recovery_gate_state[env_ids] = 0.0
+        self._recovery_hold_left[env_ids] = 0.0
         n = len(env_ids)
 
         # 站立不平移：loco 命令置 0（path frame 走站立收敛分支）。

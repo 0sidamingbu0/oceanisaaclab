@@ -235,16 +235,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         foot_body_ids = []
         foot_body_names = []
         if args_cli.debug_push_steps:
-            for body_id, body_name in enumerate(env.unwrapped.robot.body_names):
-                body_name_lower = body_name.lower()
-                if (
-                    "foot" in body_name_lower
-                    or "ankle" in body_name_lower
-                    or body_name_lower.endswith("leg_r5_link")
-                    or body_name_lower.endswith("leg_l5_link")
-                ):
-                    foot_body_ids.append(body_id)
-                    foot_body_names.append(body_name)
+            configured_foot_ids = getattr(env.unwrapped, "_feet_body_ids", None)
+            if configured_foot_ids is not None:
+                foot_body_ids = [int(body_id) for body_id in configured_foot_ids]
+                foot_body_names = [env.unwrapped.robot.body_names[body_id] for body_id in foot_body_ids]
+            else:
+                for body_id, body_name in enumerate(env.unwrapped.robot.body_names):
+                    body_name_lower = body_name.lower()
+                    if (
+                        "foot" in body_name_lower
+                        or "ankle" in body_name_lower
+                        or body_name_lower.endswith("leg_r5_link")
+                        or body_name_lower.endswith("leg_l5_link")
+                    ):
+                        foot_body_ids.append(body_id)
+                        foot_body_names.append(body_name)
             print(
                 "[debug_push] "
                 f"force_w=[{args_cli.debug_push_force_x:.1f},{args_cli.debug_push_force_y:.1f},0.0]N "
@@ -255,6 +260,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # reset environment
         obs = env.get_observations()
         timestep = 0
+        debug_foot_stats = None
+        if args_cli.debug_push_steps and foot_body_ids and hasattr(env.unwrapped, "_feet_current_contact_time"):
+            num_debug_feet = len(foot_body_ids)
+            debug_foot_stats = {
+                "initial_pos_w": None,
+                "latest_pos_w": None,
+                "previous_pos_w": None,
+                "previous_contact": None,
+                "max_xy_delta_w": torch.zeros(num_debug_feet, 2),
+                "max_xy_distance": torch.zeros(num_debug_feet),
+                "max_liftoff_height": torch.zeros(num_debug_feet),
+                "liftoff_count": torch.zeros(num_debug_feet, dtype=torch.int64),
+                "touchdown_count": torch.zeros(num_debug_feet, dtype=torch.int64),
+                "liftoff_origin_xy_w": torch.zeros(num_debug_feet, 2),
+                "liftoff_origin_z_w": torch.zeros(num_debug_feet),
+                "liftoff_origin_valid": torch.zeros(num_debug_feet, dtype=torch.bool),
+                "max_touchdown_step_delta_w": torch.zeros(num_debug_feet, 2),
+                "max_touchdown_step_distance": torch.zeros(num_debug_feet),
+                "reset_count": 0,
+            }
         # simulate environment
         try:
             while True:
@@ -281,6 +306,95 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                             body_ids=env_unwrapped._base_body_id,
                             is_global=True,
                         )
+                        debug_foot_pos_w = None
+                        debug_foot_contact = None
+                        if debug_foot_stats is not None:
+                            debug_foot_pos_w = (
+                                env_unwrapped.robot.data.body_pos_w.torch[0, foot_body_ids].detach().cpu()
+                            )
+                            debug_foot_contact = (
+                                env_unwrapped._feet_current_contact_time()[0].detach().cpu() > 0.0
+                            )
+                            if debug_foot_contact.numel() != len(foot_body_ids):
+                                raise RuntimeError(
+                                    "Debug foot body/contact count mismatch: "
+                                    f"{len(foot_body_ids)} bodies vs {debug_foot_contact.numel()} contacts."
+                                )
+
+                            if debug_foot_stats["initial_pos_w"] is None:
+                                debug_foot_stats["initial_pos_w"] = debug_foot_pos_w.clone()
+                            else:
+                                initial_pos_w = debug_foot_stats["initial_pos_w"]
+                                xy_delta_w = debug_foot_pos_w[:, :2] - initial_pos_w[:, :2]
+                                xy_distance = torch.norm(xy_delta_w, dim=1)
+                                farther_from_start = xy_distance > debug_foot_stats["max_xy_distance"]
+                                debug_foot_stats["max_xy_distance"] = torch.maximum(
+                                    debug_foot_stats["max_xy_distance"], xy_distance
+                                )
+                                debug_foot_stats["max_xy_delta_w"][farther_from_start] = xy_delta_w[
+                                    farther_from_start
+                                ]
+
+                                previous_contact = debug_foot_stats["previous_contact"]
+                                previous_pos_w = debug_foot_stats["previous_pos_w"]
+                                if previous_contact is not None:
+                                    liftoff = previous_contact & ~debug_foot_contact
+                                    touchdown = ~previous_contact & debug_foot_contact
+                                    debug_foot_stats["liftoff_count"] += liftoff.to(torch.int64)
+                                    debug_foot_stats["liftoff_origin_xy_w"][liftoff] = previous_pos_w[
+                                        liftoff, :2
+                                    ]
+                                    debug_foot_stats["liftoff_origin_z_w"][liftoff] = previous_pos_w[
+                                        liftoff, 2
+                                    ]
+                                    debug_foot_stats["liftoff_origin_valid"][liftoff] = True
+
+                                    valid_airborne = (
+                                        ~debug_foot_contact
+                                        & debug_foot_stats["liftoff_origin_valid"]
+                                    )
+                                    liftoff_height = torch.clamp(
+                                        debug_foot_pos_w[:, 2]
+                                        - debug_foot_stats["liftoff_origin_z_w"],
+                                        min=0.0,
+                                    )
+                                    debug_foot_stats["max_liftoff_height"][valid_airborne] = (
+                                        torch.maximum(
+                                            debug_foot_stats["max_liftoff_height"][valid_airborne],
+                                            liftoff_height[valid_airborne],
+                                        )
+                                    )
+
+                                    valid_touchdown = touchdown & debug_foot_stats["liftoff_origin_valid"]
+                                    debug_foot_stats["touchdown_count"] += valid_touchdown.to(torch.int64)
+                                    touchdown_step_delta_w = (
+                                        debug_foot_pos_w[:, :2] - debug_foot_stats["liftoff_origin_xy_w"]
+                                    )
+                                    touchdown_step_distance = torch.norm(touchdown_step_delta_w, dim=1)
+                                    longer_step = (
+                                        valid_touchdown
+                                        & (
+                                            touchdown_step_distance
+                                            > debug_foot_stats["max_touchdown_step_distance"]
+                                        )
+                                    )
+                                    debug_foot_stats["max_touchdown_step_distance"] = torch.maximum(
+                                        debug_foot_stats["max_touchdown_step_distance"],
+                                        torch.where(
+                                            valid_touchdown,
+                                            touchdown_step_distance,
+                                            torch.zeros_like(touchdown_step_distance),
+                                        ),
+                                    )
+                                    debug_foot_stats["max_touchdown_step_delta_w"][longer_step] = (
+                                        touchdown_step_delta_w[longer_step]
+                                    )
+                                    debug_foot_stats["liftoff_origin_valid"][touchdown] = False
+
+                            debug_foot_stats["latest_pos_w"] = debug_foot_pos_w.clone()
+                            debug_foot_stats["previous_pos_w"] = debug_foot_pos_w.clone()
+                            debug_foot_stats["previous_contact"] = debug_foot_contact.clone()
+
                         should_print = push_active or timestep % 10 == 0
                         if should_print:
                             leg_ids = env_unwrapped._leg_dof_idx
@@ -293,18 +407,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                             scale0 = (
                                 torch.tensor(ranges0) if ranges0 is not None else env_unwrapped.cfg.action_scale
                             )
+                            leg_action0 = clipped0[: len(leg_ids)]
                             target0 = (
                                 env_unwrapped._default_leg_joint_pos[0].detach().cpu()
-                                + scale0 * clipped0
+                                + scale0 * leg_action0
                             )
                             root_pos = env_unwrapped.robot.data.root_pos_w.torch[0].detach().cpu()
                             root_lin_vel_b = env_unwrapped.robot.data.root_lin_vel_b.torch[0].detach().cpu()
                             root_ang_vel_b = env_unwrapped.robot.data.root_ang_vel_b.torch[0].detach().cpu()
                             gravity_b = env_unwrapped.robot.data.projected_gravity_b.torch[0].detach().cpu()
-                            foot_z_text = ""
-                            if foot_body_ids:
-                                body_pos = env_unwrapped.robot.data.body_pos_w.torch[0, foot_body_ids, 2].detach().cpu()
-                                foot_z_text = f" foot_z={body_pos.numpy().round(3).tolist()}"
+                            foot_state_text = ""
+                            if debug_foot_pos_w is not None:
+                                initial_pos_w = debug_foot_stats["initial_pos_w"]
+                                foot_xy_delta_w = debug_foot_pos_w[:, :2] - initial_pos_w[:, :2]
+                                foot_lift = torch.clamp(
+                                    debug_foot_pos_w[:, 2] - initial_pos_w[:, 2], min=0.0
+                                )
+                                foot_state_text = (
+                                    f" foot_xy_delta_w={foot_xy_delta_w.numpy().round(3).tolist()}"
+                                    f" foot_lift={foot_lift.numpy().round(3).tolist()}"
+                                    f" foot_contact={debug_foot_contact.to(torch.int8).tolist()}"
+                                )
                             print(
                                 "[debug_push] "
                                 f"step={timestep} active={int(push_active)} "
@@ -317,7 +440,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                                 f"dq={dq0.numpy().round(3).tolist()} "
                                 f"action={action0.numpy().round(3).tolist()} "
                                 f"target={target0.numpy().round(3).tolist()}"
-                                f"{foot_z_text}"
+                                f"{foot_state_text}"
                             )
                     if args_cli.debug_policy_steps and timestep < args_cli.debug_policy_steps:
                         env_unwrapped = env.unwrapped
@@ -334,7 +457,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                             scale0 = (
                                 torch.tensor(ranges0) if ranges0 is not None else env_unwrapped.cfg.action_scale
                             )
-                            target0 = default0 + scale0 * clipped0
+                            leg_action0 = clipped0[: len(leg_ids)]
+                            target0 = default0 + scale0 * leg_action0
                             print(f"[debug_play] step={timestep} joint_names={joint_names}")
                             print(
                                 "[debug_play] "
@@ -352,6 +476,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         )
                     # env stepping
                     obs, _, dones, _ = env.step(actions)
+                    if debug_foot_stats is not None and bool(dones.reshape(-1)[0].item()):
+                        debug_foot_stats["reset_count"] += 1
+                        debug_foot_stats["previous_pos_w"] = None
+                        debug_foot_stats["previous_contact"] = None
+                        debug_foot_stats["liftoff_origin_valid"].zero_()
                     # reset recurrent states for episodes that have terminated
                     if version.parse(installed_version) >= version.parse("4.0.0"):
                         policy.reset(dones)
@@ -373,6 +502,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 sleep_time = dt - (time.time() - start_time)
                 if args_cli.real_time and sleep_time > 0:
                     time.sleep(sleep_time)
+
+            if debug_foot_stats is not None and debug_foot_stats["initial_pos_w"] is not None:
+                initial_pos_w = debug_foot_stats["initial_pos_w"]
+                latest_pos_w = debug_foot_stats["latest_pos_w"]
+                print(f"[debug_push_summary] episode_resets={debug_foot_stats['reset_count']}")
+                for foot_index, foot_name in enumerate(foot_body_names):
+                    final_xy_delta_w = latest_pos_w[foot_index, :2] - initial_pos_w[foot_index, :2]
+                    print(
+                        "[debug_push_summary] "
+                        f"foot={foot_name} "
+                        f"initial_xy_w={initial_pos_w[foot_index, :2].numpy().round(4).tolist()} "
+                        f"final_xy_w={latest_pos_w[foot_index, :2].numpy().round(4).tolist()} "
+                        f"final_xy_delta_w={final_xy_delta_w.numpy().round(4).tolist()} "
+                        f"max_xy_delta_w={debug_foot_stats['max_xy_delta_w'][foot_index].numpy().round(4).tolist()} "
+                        f"max_xy_distance={debug_foot_stats['max_xy_distance'][foot_index].item():.4f}m "
+                        f"max_liftoff_height={debug_foot_stats['max_liftoff_height'][foot_index].item():.4f}m "
+                        f"liftoffs={debug_foot_stats['liftoff_count'][foot_index].item()} "
+                        f"touchdowns={debug_foot_stats['touchdown_count'][foot_index].item()} "
+                        "max_touchdown_step_delta_w="
+                        f"{debug_foot_stats['max_touchdown_step_delta_w'][foot_index].numpy().round(4).tolist()} "
+                        "max_touchdown_step_distance="
+                        f"{debug_foot_stats['max_touchdown_step_distance'][foot_index].item():.4f}m"
+                    )
 
             # close the simulator
             env.close()

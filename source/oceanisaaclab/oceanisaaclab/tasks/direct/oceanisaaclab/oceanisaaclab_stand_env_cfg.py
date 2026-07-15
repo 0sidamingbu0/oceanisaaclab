@@ -6,7 +6,8 @@
 """路线 B（BDX 论文复刻）站立（perpetual）任务配置。
 
 对照论文 divide-and-conquer：periodic 行走策略之外，单独训练 perpetual 站立策略
-π(a | s, g_perp)，**无相位**、脚不迈步。命令 g_perp = (Δh_head, Δθ_head, h_torso,
+π(a | s, g_perp)，**无相位**。参考动作是双脚支撑的静态姿态，但策略在受扰恢复时允许
+像论文实验所述偏离参考接触序列并迈步。命令 g_perp = (Δh_head, Δθ_head, h_torso,
 θ_torso)（式 5）——躯干高度/朝向 + 头部高度/朝向。观测去掉行走策略的相位二阶谐波，
 命令由行走的 (cmd3 + head4) 换成 (torso4 + head4)。
 
@@ -45,6 +46,13 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     # 站立姿态参考库（scripts/gen_stand_pose.py 生成）
     # ------------------------------------------------------------------
     stand_pose_path = str(OCEAN_ASSET_DIR / "gaits" / "stand_pose.npz")
+
+    # Walking 为抑制行进时甩头使用约 1/3 的硬件适配范围。Perpetual standing 是论文的
+    # 表现性姿态策略，应独立恢复 neck_head_map.npz 覆盖的完整可达域，不能继承 walking 限幅。
+    head_command_dh_range = (-0.02, 0.02)
+    head_command_pitch_range = (-0.5, 0.5)
+    head_command_yaw_range = (-1.0, 1.0)
+    head_command_roll_range = (-0.6, 0.6)
 
     # ------------------------------------------------------------------
     # 躯干命令 g_perp 的 (h_torso, θ_torso) 部分：4-DOF 高度 + 朝向。
@@ -98,6 +106,37 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     rew_w_neck_action_rate = -5.0
     rew_w_neck_action_acc = -5.0
     rew_w_survival = 20.0
+
+    # ------------------------------------------------------------------
+    # 受扰恢复奖励门控。
+    # 稳态 gate=0 时严格使用上面的论文 Table I 权重；失衡后 gate 平滑升到 1，仅放松会
+    # 直接阻止抬脚的双脚接触、静态腿参考与腿动作平滑约束。躯干位姿/速度、存活、力矩和
+    # 关节加速度奖励始终保留，负责驱动策略通过跨步把身体带回稳定区。
+    # gate 只使用 policy 已观测且真机可靠可得的 path-frame 躯干位置、IMU 姿态/角速度、
+    # 状态估计水平速度和双脚接触。快速开启、慢速释放，避免摆动脚尚未落地就恢复强约束。
+    # ------------------------------------------------------------------
+    enable_recovery_reward_gating = True
+    recovery_tilt_error_start = 0.08  # [rad]
+    recovery_tilt_error_full = 0.22  # [rad]
+    recovery_lin_vel_start = 0.18  # [m/s]
+    recovery_lin_vel_full = 0.45  # [m/s]
+    recovery_ang_vel_start = 0.45  # [rad/s]
+    recovery_ang_vel_full = 1.40  # [rad/s]
+    recovery_pos_error_start = 0.025  # [m], torso 相对参考支撑中心的平面偏移
+    recovery_pos_error_full = 0.065  # [m]
+    recovery_activation_gate = 0.10
+    recovery_command_grace_s = 0.35  # 命令重采样后暂不使用瞬时姿态误差触发
+    recovery_hold_s = 0.30  # 重新双脚着地后仍保持放松，允许落脚稳定
+    recovery_release_s = 0.40  # 保持结束后从当前 gate 线性释放到稳态权重
+    # 门控对奖励权重的作用随论文扰动课程同步从 0 放开到 1，避免随机初始策略在第一个
+    # update 就关闭双脚接触/强姿态模仿，先形成稳定站立基线再学习主动捕获步。
+    recovery_gate_curriculum_delay_steps = 0
+    recovery_gate_curriculum_steps = 36_000
+    recovery_contact_weight_scale = 0.0
+    recovery_rew_w_leg_joint_pos = -3.0
+    recovery_rew_w_action_rate = -0.25
+    recovery_rew_w_action_acc = -0.075
+    recovery_metric_gate_threshold = 0.10
 
     # 论文站立扰动从训练开始用 1500 iteration（24 steps/iter）线性放开。
     disturbance_curriculum_delay_steps = 0

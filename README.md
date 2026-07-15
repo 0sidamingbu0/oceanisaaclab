@@ -106,14 +106,18 @@
 
 ### 路线 B（站立）：BDX 论文 perpetual 站立策略 `Ocean-BDX-StandPaper-Direct-v0`
 
-论文 divide-and-conquer 的第二个独立策略 π(a | s, g_perp)：**无相位**、脚不迈步，专管
-「摆站姿 + 转头」。与行走策略共用机器人模型与整套 sim2real 机制（附录 B 执行器模型、
+论文 divide-and-conquer 的第二个独立策略 π(a | s, g_perp)：**无相位**，静态参考保持双脚
+支撑，但受扰恢复时允许偏离参考接触序列并主动迈步。它专管「摆站姿 + 转头」，与行走策略
+共用机器人模型与整套 sim2real 机制（附录 B 执行器模型、
 表 V 扰动、域随机化、torso 等效触地终止、非对称 critic、path frame、脖子位置伺服）。
 
 - **命令 g_perp（8 维）**：躯干 4-DOF（h 高度 / pitch 前后倾 / yaw 偏航 / roll 侧倾）
   + 头部 4-DOF（Δh / pitch / yaw / roll，复用 `neck_head_map`）。本机双脚约束 IK 扫描后的
   torso 可行域为 h `[-0.04,+0.01]m`、pitch `±0.17rad`、yaw `±0.24rad`、roll
-  `±0.09rad`；命令在 episode 内每 `4-8s` 重采样，覆盖论文要求的连续控制输入。
+  `±0.09rad`。StandPaper 的 head 完整域为 Δh `±0.02m`、pitch `±0.50rad`、yaw
+  `±1.00rad`、roll `±0.60rad`；walking 为抑制行进甩头仍保持约 1/3 域
+  (`±0.007m / ±0.17 / ±0.33 / ±0.20rad`)。命令在 episode 内每 `4-8s` 重采样，覆盖论文
+  要求的连续控制输入。
 - **观测 77 维**：相比行走去掉相位二阶谐波(4)、命令由 vx/vy/wz(3) 换成躯干命令(4)
   （净 −3）；保留 path 系 xy/yaw、`projected_gravity`、body 线/角速度、腿+脖子 q/q̇、
   两帧 14 维动作历史。非对称 critic 再加摩擦/质量特权量，共 79 维。
@@ -125,13 +129,23 @@
   双脚接触、全 14 关节力矩/关节加速度、动作平滑及 survival。`torso_pos` 核恢复为 200、
   orientation 权重恢复为 1、survival 恢复为 20；躯干高度通过站立腿参考表达，不再添加
   论文之外的独立 height reward。
+- **受扰恢复门控**：稳定时严格使用上述 Table I 权重；相对命令姿态的 roll/pitch 倾斜误差、
+  body 水平速度、roll/pitch 角速度或 path-frame torso 平面偏移升高时，只放松既有的双脚接触、
+  腿姿态模仿和腿动作平滑约束。命令重采样后 `0.35s` 只忽略瞬时 tilt error；速度、角速度和
+  位置误差仍可触发。stand_pose 全命令域的 `base_pos_pf` 相对 neutral 最多只变 `1.70mm`，远低于
+  position gate 的 `25mm` 起点，因此保留位置触发不会误判命令跳变，也避免慢速平移失稳盲区。
+  门控快速开启、单脚支撑期间保持，恢复双支撑后再保持 `0.30s`，随后按
+  `0.40s` 满量程慢释放；其奖励作用与论文扰动同步在前 1500 iteration / 36000 steps 从 0 放到
+  1，避免随机初始策略立即关闭稳站约束。躯干/速度/survival/力矩/关节加速度目标始终保留；
+  没有新增脚高、指定摆动脚或迈步奖励，也没有硬编码恢复脚序。
 - **站立 RSI**：50% episode 使用 torso/head 全零的共享 neutral 状态；其余覆盖完整姿态命令。
   `stand_rsi_prob=0.8` 时从命令对应参考出生，其余从 neutral 学习过渡。q、FOH/LPF 目标、
   延迟环和前两帧动作全部初始化为同一个 14 维 setpoint，不再残留 walking RSI 动作。
 - **path frame**：站立分支收敛到双脚中心和消除左右 link-frame 偏置后的双脚平均 heading，
   不是收敛到躯干 yaw；行走和站立使用同一份 path-frame 状态。
 - **动作与频率**：14 维动作与行走完全同构，50Hz policy / 200Hz low-level，腿和脖子目标都
-  经过 FOH + 37.5Hz 低通。PPO `entropy_coef=0`，其余网络/算法参数沿用论文配置。
+  经过 FOH + 37.5Hz 低通。为让满强度扰动出现后仍保留跨步探索，Stand PPO 使用
+  `entropy_coef=0.001`、`min_std=0.05`，其余网络/算法参数沿用现有论文适配配置。
 
     ```bash
     # 训练（与行走各训各的，运行时按需切换策略）
@@ -143,13 +157,18 @@
       --checkpoint logs/rsl_rl/bdx_stand_perpetual/<run>/model_<iter>.pt
     ```
 
-旧 `74/76` 维站立 checkpoint 和 ONNX 不能恢复或部署到当前任务。训练完成后需要重新导出，
-并同步替换 OceanBDX 的 `policy/stand/policy.onnx[.data]`。完整接口与迁移检查见
+旧 `74/76` 维站立 checkpoint 和 ONNX 在形状上不兼容；此前的 77 维站立模型虽然形状匹配，
+但只见过约 1/3 head 域，也没有当前受扰门控与探索分布，不能 resume 后当作本配置结果，更
+不能直接接收完整 head 命令。必须从头训练并重新导出，再同步替换 OceanBDX 的
+`policy/stand/policy.onnx[.data]`。训练时重点监控 raw `Metrics/recovery_signal_mean`、有效
+`Metrics/recovery_gate_mean`、`Curriculum/recovery_gate_scale`、恢复期单脚支撑/liftoff/
+touchdown、落脚距离和 `fall_rate`。完整接口与迁移检查见
 [`BDX_STAND_TRAINING.md`](source/oceanisaaclab/docs/BDX_STAND_TRAINING.md)。
 
 运行时切换必须遵循论文 Fig.9：两策略共享最近两帧**实际归一化动作**、path frame 以及腿/脖子
-FOH/LPF 当前目标；stand→walk 在控制周期边界切换并按转向方向初始化行走相位，walk→stand
-等待下一次确认的双支撑再切换，并用切换瞬间的实测躯干高度/姿态初始化 standing torso 命令。
+FOH/LPF 当前目标。walk→stand 先由 walking policy 平滑减速并在参考双支撑窗口过零，连续确认
+IMU 与腿 q/dq 稳定后才切换，进入 standing 后使用 neutral torso 命令；stand→walk 先由
+standing policy 将 torso 平滑回 neutral 并确认稳定，再在控制周期边界切换。
 Python sim2sim 的 path frame 使用脚 link body origin，而非 sole geom center；两者在 q=0 下会
 造成约 `2.585cm` 偏差。起立脚本接管 RL 时另用 `0.5s` 余弦增益过渡，把腿部 `50/3` 平滑降到
 论文 Go1 plant 的 `10/0.3`，并以同一权重从实测 torso 命令起点平滑回用户/neutral 命令、

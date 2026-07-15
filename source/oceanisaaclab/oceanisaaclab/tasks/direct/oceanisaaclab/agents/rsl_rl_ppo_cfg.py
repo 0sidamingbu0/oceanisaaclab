@@ -112,16 +112,27 @@ class StandPPORunnerCfg(WalkPPORunnerCfg):
     """路线 B（BDX 论文复刻）站立（perpetual）runner。
 
     网络/算法沿用 WalkPPORunnerCfg（3×512 ELU + 非对称 critic + obs_groups），维度由环境
-    观测/状态空间自动推断，无需改。仅换日志目录名。站立任务不存在"站着不动=最优"的行走
-    局部最优（本来就要站稳），entropy_coef 调回论文原值 0（不需要额外探索去破盆地）。
+    观测/状态空间自动推断，无需改。仅换日志目录名。静态站立本身没有行走的零速盆地，
+    但主动跨步恢复需要在大扰动课程放开后仍保留少量探索。
+    因此 entropy 使用与 walking 相同的硬件适配值 0.001，动作标准差下限提高到 0.05。
     """
 
     experiment_name = "bdx_stand_perpetual"
+    actor = RslRlMLPModelCfg(
+        hidden_dims=[512, 512, 512],
+        activation="elu",
+        obs_normalization=True,
+        distribution_cfg=SquashedGaussianDistributionCfg(
+            init_std=0.3,
+            min_std=0.05,
+            max_std=0.6,
+        ),
+    )
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.0,
+        entropy_coef=0.001,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=3.0e-4,
