@@ -135,12 +135,13 @@
   真机可得的 IMU、状态估计速度、path-frame 位置和脚接触计算 Schmitt 诊断状态：失稳信号达到
   `0.35` 才标记恢复，低于 `0.10` 且双脚稳定 `0.30s` 后退出。该状态不进入奖励、不改变动作，
   也没有新增脚高、指定左右摆动脚或迈步奖励；捕获步仍由 Table V 大扰动下的存活与躯干模仿收益自行学出。
-- **站立 RSI**：50% episode 使用 torso/head 全零的共享 neutral 状态；其余覆盖完整姿态命令。
-  `stand_rsi_prob=0.8` 时从命令对应参考出生，其余从 neutral 学习过渡。q、FOH/LPF 目标、
-  延迟环和前两帧动作全部初始化为同一个 14 维 setpoint，不再残留 walking RSI 动作。
-- **训练样本分层**：默认 50% episode 完全关闭外力作为 nominal 双支撑基线，另外 50% 保持完整
-  Table V 扰动过程。该比例只用于训练分布，不进入观测、不改变奖励；用
-  `clean_liftoff_events_per_episode` 和 `clean_double_support_rate` 验收无扰时锁脚。
+- **站立 RSI 与恢复 reset**：标准站立命令继续使用 `stand_pose.npz`；独立的
+  `stand_recovery_resets.npz` 只提供双脚贴地、CoM 平衡但脚距缩小/加宽、前后错位或相对 yaw
+  偏移的出生状态。错误脚位绝不成为奖励参考，策略仍由固定 Table I 收益将其校正回 q=0 标准站姿。
+  q、root、path frame、FOH/LPF 目标、延迟环和前两帧动作均从同一 reset 状态同步初始化。
+- **训练样本分层**：默认约 25% 标准无扰动、25% 错误脚位无扰动、50% 完整 Table V 扰动。
+  错误脚位幅度从 30% 开始，在前 1500 iteration 放开到 100%；分布标签不进入观测且不改变奖励。
+  当前库覆盖最大 50mm 脚距缩小、40mm 加宽、50mm 前后错位和 0.08rad 相对 yaw。
 - **path frame**：站立分支收敛到双脚中心和消除左右 link-frame 偏置后的双脚平均 heading，
   不是收敛到躯干 yaw；行走和站立使用同一份 path-frame 状态。
 - **动作与频率**：14 维动作与行走完全同构，50Hz policy / 200Hz low-level，腿和脖子目标都
@@ -159,16 +160,17 @@
 
 旧 `74/76` 维站立 checkpoint 和 ONNX 在形状上不兼容；当前 77 维模型也不能续训，因为旧版
 恢复门控曾把 contact/腿姿态约束长期关闭，已学成小碎步局部解。必须从头训练并重新导出，再同步替换 OceanBDX 的
-`policy/stand/policy.onnx[.data]`。训练时重点监控 `Metrics/recovery_signal_mean`、
-`Metrics/recovery_active_rate`、`Metrics/recovery_capture_steps_per_episode`、
-`Metrics/quiet_liftoff_events_per_episode`、`Metrics/quiet_foot_drift_cm`、恢复期 touchdown
-落脚距离和 `fall_rate`。完整接口与迁移检查见
+`policy/stand/policy.onnx[.data]`。本次又改变了 reset 分布，正式模型应从头训练 100000 iteration；
+旧 checkpoint 只适合短期 A/B 检查。训练时重点监控 `fall_rate`、clean 锁脚、错误脚位恢复成功率/
+恢复时间、标准脚距误差和受扰捕获步。完整接口与迁移检查见
 [`BDX_STAND_TRAINING.md`](source/oceanisaaclab/docs/BDX_STAND_TRAINING.md)。
 
 运行时切换必须遵循论文 Fig.9：两策略共享最近两帧**实际归一化动作**、path frame 以及腿/脖子
 FOH/LPF 当前目标。walk→stand 先由 walking policy 平滑减速并在参考双支撑窗口过零，连续确认
 IMU 与腿 q/dq 稳定后才切换，进入 standing 后使用 neutral torso 命令；stand→walk 先由
 standing policy 将 torso 平滑回 neutral 并确认稳定，再在控制周期边界切换。
+OceanBDX 还会用腿编码器 FK 检查双脚相对脚距、前后错位和 yaw；错误脚位未恢复时继续由站立
+策略 neutral 闭环校正，恢复到门槛内后自动放行，不会超时强切或关闭关节输出。
 Python sim2sim 的 path frame 使用脚 link body origin，而非 sole geom center；两者在 q=0 下会
 造成约 `2.585cm` 偏差。起立脚本接管 RL 时另用 `0.5s` 余弦增益过渡，把腿部 `50/3` 平滑降到
 论文 Go1 plant 的 `10/0.3`，并以同一权重从实测 torso 命令起点平滑回用户/neutral 命令、

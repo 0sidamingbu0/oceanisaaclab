@@ -19,11 +19,17 @@ from __future__ import annotations
 import torch
 from collections.abc import Sequence
 
-from isaaclab.utils.math import quat_error_magnitude, quat_from_euler_xyz, sample_uniform
+from isaaclab.utils.math import (
+    euler_xyz_from_quat,
+    quat_error_magnitude,
+    quat_from_euler_xyz,
+    sample_uniform,
+)
 
 from .oceanisaaclab_stand_env_cfg import OceanisaaclabStandEnvCfg
 from .oceanisaaclab_walk_env import OceanisaaclabWalkEnv
-from .reference_gait import StandPose
+from .path_frame import wrap_angle
+from .reference_gait import StandPose, StandRecoveryResetLibrary
 
 
 class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
@@ -33,6 +39,9 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         super().__init__(cfg, render_mode, **kwargs)
         # 站立姿态参考库（torso4 + head4 -> 全身 CoM 平衡腿角）；脖子角沿用 _neck_head_map。
         self._stand_pose = StandPose(self.cfg.stand_pose_path, self.device)
+        self._stand_recovery_resets = StandRecoveryResetLibrary(
+            self.cfg.stand_recovery_reset_path, self.device
+        )
         neutral_torso = torch.zeros(1, 4, device=self.device)
         neutral_head = torch.zeros(1, 4, device=self.device)
         neutral_leg = self._stand_pose.sample(neutral_torso, neutral_head)
@@ -73,6 +82,10 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
             rtol=0.0,
         ):
             raise RuntimeError("Stand/walk zero-command path-frame torso positions do not match.")
+        if self._stand_recovery_resets.joint_names != self._stand_pose.joint_names:
+            raise RuntimeError("Stand recovery reset joint order does not match stand_pose.npz.")
+        if abs(self._stand_recovery_resets.base_height - self._stand_pose.base_height) > 1.0e-6:
+            raise RuntimeError("Stand recovery reset and reference base heights do not match.")
         self._torso_commands = torch.zeros(self.num_envs, 4, device=self.device)
         self._torso_command_scale = torch.tensor(
             self.cfg.torso_command_scale, dtype=torch.float, device=self.device
@@ -127,6 +140,24 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         self._metric_clean_steps = torch.zeros(self.num_envs, device=self.device)
         self._metric_clean_liftoff_events = torch.zeros(self.num_envs, device=self.device)
         self._metric_clean_double_support = torch.zeros(self.num_envs, device=self.device)
+        self._metric_stance_width_error = torch.zeros(self.num_envs, device=self.device)
+        self._metric_stance_stagger_error = torch.zeros(self.num_envs, device=self.device)
+        self._metric_stance_yaw_error = torch.zeros(self.num_envs, device=self.device)
+        self._metric_displaced_steps = torch.zeros(self.num_envs, device=self.device)
+        self._metric_displaced_liftoff_events = torch.zeros(self.num_envs, device=self.device)
+        self._metric_displaced_double_support = torch.zeros(self.num_envs, device=self.device)
+        self._stand_displaced_reset = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._stand_displaced_reset_category = torch.full(
+            (self.num_envs,), -1, dtype=torch.long, device=self.device
+        )
+        self._stand_displaced_recovery_hold = torch.zeros(self.num_envs, device=self.device)
+        self._stand_displaced_recovery_elapsed = torch.zeros(self.num_envs, device=self.device)
+        self._stand_displaced_recovery_success = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._stand_displaced_recovery_time = torch.zeros(self.num_envs, device=self.device)
         self._stand_previous_contact = torch.ones(self.num_envs, 2, device=self.device)
         self._stand_foot_airborne = torch.zeros(
             self.num_envs, 2, dtype=torch.bool, device=self.device
@@ -151,6 +182,44 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
             return
         quiet = torch.rand(len(env_ids), device=self.device) < self.cfg.stand_disturbance_quiet_prob
         self._stand_disturbance_enabled[env_ids] = ~quiet
+
+    def _displaced_reset_curriculum_scale(self) -> float:
+        initial = float(self.cfg.stand_displaced_reset_initial_scale)
+        duration = max(1, int(self.cfg.stand_displaced_reset_curriculum_steps))
+        progress = min(1.0, float(self.common_step_counter) / duration)
+        return initial + (1.0 - initial) * progress
+
+    def _sample_stand_reset_modes(self, env_ids: torch.Tensor) -> None:
+        """Select non-canonical resets only inside no-disturbance episodes."""
+        quiet = ~self._stand_disturbance_enabled[env_ids]
+        displaced = quiet & (
+            torch.rand(len(env_ids), device=self.device)
+            < self.cfg.stand_displaced_reset_prob_within_quiet
+        )
+        self._stand_displaced_reset[env_ids] = displaced
+        self._stand_displaced_reset_category[env_ids] = -1
+
+    def _stance_relative_pose(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return left-to-right foot translation and yaw in the calibrated feet frame."""
+        foot_pos = self.robot.data.body_pos_w.torch[:, self._feet_body_ids, :2]
+        delta_w = foot_pos[:, 1] - foot_pos[:, 0]
+        heading = self._feet_heading_yaw()
+        cos_h, sin_h = torch.cos(heading), torch.sin(heading)
+        relative_xy = torch.stack(
+            (
+                delta_w[:, 0] * cos_h + delta_w[:, 1] * sin_h,
+                -delta_w[:, 0] * sin_h + delta_w[:, 1] * cos_h,
+            ),
+            dim=1,
+        )
+        foot_quat = self.robot.data.body_quat_w.torch[:, self._feet_body_ids]
+        _, _, raw_yaw = euler_xyz_from_quat(foot_quat.reshape(-1, 4))
+        raw_yaw = raw_yaw.view(self.num_envs, 2)
+        calibrated_yaw = wrap_angle(
+            raw_yaw - self._stand_pose.foot_yaw_neutral.unsqueeze(0)
+        )
+        relative_yaw = wrap_angle(calibrated_yaw[:, 1] - calibrated_yaw[:, 0])
+        return relative_xy, relative_yaw
 
     def _update_paper_disturbances(self) -> None:
         """Apply Table V, then suppress all wrenches for selected clean episodes."""
@@ -527,6 +596,66 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         self._metric_clean_steps += clean_episode.float()
         self._metric_clean_liftoff_events += liftoff_count * clean_episode.float()
         self._metric_clean_double_support += torch.prod(in_contact, dim=1) * clean_episode.float()
+
+        relative_foot_xy, relative_foot_yaw = self._stance_relative_pose()
+        nominal_xy = self._stand_recovery_resets.nominal_foot_relative_xy.unsqueeze(0)
+        width_error = torch.abs(relative_foot_xy[:, 1] - nominal_xy[:, 1])
+        stagger_error = torch.abs(relative_foot_xy[:, 0] - nominal_xy[:, 0])
+        yaw_error = torch.abs(
+            wrap_angle(
+                relative_foot_yaw
+                - self._stand_recovery_resets.nominal_foot_relative_yaw
+            )
+        )
+        self._metric_stance_width_error += width_error
+        self._metric_stance_stagger_error += stagger_error
+        self._metric_stance_yaw_error += yaw_error
+
+        displaced = self._stand_displaced_reset
+        displaced_active = displaced & ~self._stand_displaced_recovery_success
+        self._stand_displaced_recovery_elapsed += displaced_active.float() * self.step_dt
+        canonical = (
+            (width_error <= cfg.stance_recovery_width_tolerance_m)
+            & (stagger_error <= cfg.stance_recovery_stagger_tolerance_m)
+            & (yaw_error <= cfg.stance_recovery_yaw_tolerance_rad)
+        )
+        physically_stable = (
+            (torch.prod(in_contact, dim=1) > 0.5)
+            & (
+                torch.linalg.vector_norm(projected_gravity[:, :2], dim=1)
+                <= cfg.stance_recovery_projected_gravity_xy_max
+            )
+            & (
+                torch.linalg.vector_norm(lin_vel[:, :2], dim=1)
+                <= cfg.stance_recovery_lin_vel_xy_max
+            )
+            & (
+                torch.linalg.vector_norm(ang_vel[:, :2], dim=1)
+                <= cfg.stance_recovery_ang_vel_xy_max
+            )
+            & (
+                torch.sqrt(torch.mean(torch.square(joint_vel), dim=1))
+                <= cfg.stance_recovery_joint_vel_rms_max
+            )
+        )
+        recovery_stable = displaced_active & canonical & physically_stable
+        self._stand_displaced_recovery_hold = torch.where(
+            recovery_stable,
+            self._stand_displaced_recovery_hold + self.step_dt,
+            torch.zeros_like(self._stand_displaced_recovery_hold),
+        )
+        completed = displaced_active & (
+            self._stand_displaced_recovery_hold >= cfg.stance_recovery_stable_hold_s
+        )
+        self._stand_displaced_recovery_success |= completed
+        self._stand_displaced_recovery_time = torch.where(
+            completed,
+            self._stand_displaced_recovery_elapsed,
+            self._stand_displaced_recovery_time,
+        )
+        self._metric_displaced_steps += displaced.float()
+        self._metric_displaced_liftoff_events += liftoff_count * displaced.float()
+        self._metric_displaced_double_support += torch.prod(in_contact, dim=1) * displaced.float()
         self._stand_foot_airborne |= liftoff
         self._stand_foot_airborne &= ~touchdown
         self._stand_airborne_time = torch.where(touchdown, torch.zeros_like(self._stand_airborne_time), self._stand_airborne_time)
@@ -645,6 +774,38 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         log["Metrics/clean_double_support_rate"] = (
             self._metric_clean_double_support[env_ids].sum() / clean_steps
         )
+        total_metric_steps = self._stand_metric_steps[env_ids].sum().clamp_min(1.0)
+        log["Metrics/stance_width_error_cm"] = (
+            100.0 * self._metric_stance_width_error[env_ids].sum() / total_metric_steps
+        )
+        log["Metrics/stance_stagger_error_cm"] = (
+            100.0 * self._metric_stance_stagger_error[env_ids].sum() / total_metric_steps
+        )
+        log["Metrics/stance_yaw_error_rad"] = (
+            self._metric_stance_yaw_error[env_ids].sum() / total_metric_steps
+        )
+        displaced = self._stand_displaced_reset[env_ids]
+        displaced_count = displaced.float().sum().clamp_min(1.0)
+        displaced_steps = self._metric_displaced_steps[env_ids].sum().clamp_min(1.0)
+        successful = displaced & self._stand_displaced_recovery_success[env_ids]
+        successful_count = successful.float().sum().clamp_min(1.0)
+        log["Metrics/displaced_reset_fraction"] = displaced.float().mean()
+        log["Metrics/displaced_recovery_success_rate"] = (
+            successful.float().sum() / displaced_count
+        )
+        log["Metrics/displaced_recovery_time_s"] = (
+            self._stand_displaced_recovery_time[env_ids][successful].sum()
+            / successful_count
+        )
+        log["Metrics/displaced_liftoff_events_per_episode"] = (
+            self._metric_displaced_liftoff_events[env_ids].sum() / displaced_count
+        )
+        log["Metrics/displaced_double_support_rate"] = (
+            self._metric_displaced_double_support[env_ids].sum() / displaced_steps
+        )
+        log["Curriculum/stand_displaced_reset_scale"] = (
+            self._displaced_reset_curriculum_scale()
+        )
         for metric in (
             self._stand_metric_steps,
             self._metric_recovery_signal,
@@ -663,6 +824,12 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
             self._metric_clean_steps,
             self._metric_clean_liftoff_events,
             self._metric_clean_double_support,
+            self._metric_stance_width_error,
+            self._metric_stance_stagger_error,
+            self._metric_stance_yaw_error,
+            self._metric_displaced_steps,
+            self._metric_displaced_liftoff_events,
+            self._metric_displaced_double_support,
         ):
             metric[env_ids] = 0.0
         self._stand_previous_contact[env_ids] = 1.0
@@ -674,10 +841,15 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         self._recovery_state[env_ids] = 0.0
         self._recovery_active[env_ids] = False
         self._recovery_hold_left[env_ids] = 0.0
+        self._stand_displaced_recovery_hold[env_ids] = 0.0
+        self._stand_displaced_recovery_elapsed[env_ids] = 0.0
+        self._stand_displaced_recovery_success[env_ids] = False
+        self._stand_displaced_recovery_time[env_ids] = 0.0
         # The parent reset reinitializes the Table V schedules. Select the next clean or
         # disturbed episode only after logging and clearing the old episode's metrics, so
         # clean metrics are attributed to the episode that generated them.
         self._sample_stand_disturbance_modes(env_ids)
+        self._sample_stand_reset_modes(env_ids)
         n = len(env_ids)
 
         # 站立不平移：loco 命令置 0（path frame 走站立收敛分支）。
@@ -688,10 +860,17 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         # 采样 g_perp；共享零命令 env 同时把 torso/head 命令清零，构成真正的
         # stand/walk 公共切换状态，而不是“腿零命令但头仍随机”。
         zero = self._resample_stand_controls(env_ids)
+        displaced = self._stand_displaced_reset[env_ids]
+        if torch.any(displaced):
+            displaced_ids = env_ids[displaced]
+            self._torso_commands[displaced_ids] = 0.0
+            self._head_commands[displaced_ids] = 0.0
+            self._control_resample_left[displaced_ids] = self.cfg.episode_length_s
+            zero[displaced] = True
 
         # stand_rsi_prob 决定是否从命令对应参考状态出生；其余 env 从公共 neutral
         # 状态出生并学习姿态过渡。零命令无论 RSI 抽样结果如何都保持 URDF q=0 精确姿态。
-        rsi = torch.rand(n, device=self.device) < self.cfg.stand_rsi_prob
+        rsi = (torch.rand(n, device=self.device) < self.cfg.stand_rsi_prob) & ~displaced
         init_torso_commands = torch.zeros(n, 4, device=self.device)
         init_head_commands = torch.zeros(n, 4, device=self.device)
         init_torso_commands[rsi] = self._torso_commands[env_ids[rsi]]
@@ -700,19 +879,27 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         stand_ref = self._stand_pose.sample_reference(
             init_torso_commands, init_head_commands
         )
-        leg_ref = stand_ref["joint_pos"]
+        initial_leg_pos = stand_ref["joint_pos"].clone()
         noisy_rsi = rsi & ~zero
         if torch.any(noisy_rsi) and self.cfg.stand_rsi_joint_pos_noise > 0.0:
-            leg_ref[noisy_rsi] += torch.empty_like(leg_ref[noisy_rsi]).uniform_(
+            initial_leg_pos[noisy_rsi] += torch.empty_like(initial_leg_pos[noisy_rsi]).uniform_(
                 -self.cfg.stand_rsi_joint_pos_noise,
                 self.cfg.stand_rsi_joint_pos_noise,
             )
+        recovery_reset = self._stand_recovery_resets.sample(
+            int(displaced.sum().item()), self._displaced_reset_curriculum_scale()
+        )
+        if torch.any(displaced):
+            initial_leg_pos[displaced] = recovery_reset["joint_pos"]
+            self._stand_displaced_reset_category[env_ids[displaced]] = recovery_reset[
+                "category"
+            ]
 
         # Convert the initialized pose through the same bounded action mapping used at runtime.
         # Writing the representable targets back to simulation makes q, action history, FOH and
         # LPF state exactly describe one state even at command-grid extremes.
         leg_actions = torch.clamp(
-            (leg_ref - self._default_leg_joint_pos[env_ids]) / self._joint_ranges,
+            (initial_leg_pos - self._default_leg_joint_pos[env_ids]) / self._joint_ranges,
             -1.0,
             1.0,
         )
@@ -746,6 +933,8 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         joint_vel = self.robot.data.default_joint_vel.torch[env_ids].clone()
         root_pose = self.robot.data.default_root_pose.torch[env_ids].clone()
         root_pose[:, :2] = root_pose[:, :2] + self.scene.env_origins[env_ids, :2]
+        if torch.any(displaced):
+            root_pose[displaced, :2] += recovery_reset["base_pos_xy"]
         root_pose[:, 2] = self.scene.env_origins[env_ids, 2] + self._stand_pose.base_height \
             + init_torso_commands[:, 0]
         root_pose[:, 3:7] = quat_from_euler_xyz(
@@ -781,7 +970,7 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         self._substep = 0
 
         # 参考 xy 与腿角来自同一个 head+torso 全身 CoM 平衡参考。
-        pf_offset = stand_ref["base_pos_pf"]
+        pf_offset = stand_ref["base_pos_pf"].clone()
         init_base_yaw_pf = stand_ref["base_yaw_pf"]
         init_feet_heading = (
             init_torso_commands[:, 2] + self._head_yaw_offset - init_base_yaw_pf
@@ -790,10 +979,10 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
             torch.sin(init_feet_heading),
             torch.cos(init_feet_heading),
         )
-        base_xy = (
-            self.scene.env_origins[env_ids, :2]
-            + self.robot.data.default_root_pose.torch[env_ids, :2]
-        ).clone()
+        base_xy = root_pose[:, :2].clone()
+        if torch.any(displaced):
+            pf_offset[displaced] = recovery_reset["base_pos_pf"]
+            init_feet_heading[displaced] = recovery_reset["feet_heading_yaw"]
         cos_y, sin_y = torch.cos(init_feet_heading), torch.sin(init_feet_heading)
         path_xy = base_xy.clone()
         path_xy[:, 0] -= pf_offset[:, 0] * cos_y - pf_offset[:, 1] * sin_y

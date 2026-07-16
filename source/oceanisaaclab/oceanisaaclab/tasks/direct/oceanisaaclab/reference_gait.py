@@ -218,6 +218,58 @@ class NeckHeadMap:
         return out
 
 
+class StandRecoveryResetLibrary:
+    """GPU sampler for stable, non-canonical standing initial states."""
+
+    def __init__(self, npz_path: str, device: str | torch.device):
+        data = np.load(npz_path, allow_pickle=False)
+        self.device = torch.device(device)
+
+        def tensor(name: str) -> torch.Tensor:
+            return torch.as_tensor(data[name], dtype=torch.float32, device=self.device)
+
+        self.joint_pos = tensor("joint_pos")
+        self.base_pos_xy = tensor("base_pos_xy")
+        self.base_pos_pf = tensor("base_pos_pf")
+        self.feet_heading_yaw = tensor("feet_heading_yaw")
+        self.foot_relative_xy = tensor("foot_relative_xy")
+        self.foot_relative_yaw = tensor("foot_relative_yaw")
+        self.curriculum_fraction = tensor("curriculum_fraction")
+        self.sample_weight = tensor("sample_weight")
+        self.category = torch.as_tensor(data["category"], dtype=torch.long, device=self.device)
+        self.category_names = [str(name) for name in data["category_names"]]
+        self.nominal_foot_relative_xy = tensor("nominal_foot_relative_xy")
+        self.nominal_foot_relative_yaw = float(data["nominal_foot_relative_yaw"])
+        self.base_height = float(data["base_height"])
+        self.joint_names = [str(name) for name in data["joint_names"]]
+        if self.joint_pos.ndim != 2 or self.joint_pos.shape[1] != 10:
+            raise ValueError(f"invalid recovery reset joint table shape: {self.joint_pos.shape}")
+        if not torch.isclose(self.sample_weight.sum(), torch.tensor(1.0, device=self.device)):
+            raise ValueError("recovery reset sample weights must sum to one")
+
+    def sample(self, count: int, curriculum_scale: float) -> dict[str, torch.Tensor]:
+        """Sample reset rows whose normalized displacement is enabled by the curriculum."""
+        if count <= 0:
+            empty = torch.empty(0, dtype=torch.long, device=self.device)
+            return {"indices": empty}
+        scale = max(float(curriculum_scale), float(self.curriculum_fraction.min()))
+        eligible = self.curriculum_fraction <= scale + 1.0e-6
+        weights = self.sample_weight * eligible.float()
+        if not torch.any(weights > 0.0):
+            raise RuntimeError(f"no stand recovery reset samples enabled at scale {scale:.3f}")
+        indices = torch.multinomial(weights, count, replacement=True)
+        return {
+            "indices": indices,
+            "joint_pos": self.joint_pos[indices],
+            "base_pos_xy": self.base_pos_xy[indices],
+            "base_pos_pf": self.base_pos_pf[indices],
+            "feet_heading_yaw": self.feet_heading_yaw[indices],
+            "foot_relative_xy": self.foot_relative_xy[indices],
+            "foot_relative_yaw": self.foot_relative_yaw[indices],
+            "category": self.category[indices],
+        }
+
+
 class StandPose:
     """站立姿态参考的 torch 采样器（``scripts/gen_stand_pose.py`` 生成）。
 

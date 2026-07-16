@@ -47,6 +47,11 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     # 站立姿态参考库（scripts/gen_stand_pose.py 生成）
     # ------------------------------------------------------------------
     stand_pose_path = str(OCEAN_ASSET_DIR / "gaits" / "stand_pose.npz")
+    # Stable post-capture poses used only as reset states. Reward/reference targets remain
+    # stand_pose.npz, so narrow and staggered stances must be corrected rather than imitated.
+    stand_recovery_reset_path = str(
+        OCEAN_ASSET_DIR / "gaits" / "stand_recovery_resets.npz"
+    )
 
     # Walking 为抑制行进时甩头使用约 1/3 的硬件适配范围。Perpetual standing 是论文的
     # 表现性姿态策略，应独立恢复 neck_head_map.npz 覆盖的完整可达域，不能继承 walking 限幅。
@@ -75,6 +80,11 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     # ------------------------------------------------------------------
     stand_rsi_prob = 0.8
     stand_rsi_joint_pos_noise = 0.01  # [rad]，仅非零命令 RSI 使用
+    # Half of the no-disturbance episodes start from a stable non-canonical foot placement:
+    # 25% nominal clean + 25% displaced clean + 50% full Table V at the default probabilities.
+    stand_displaced_reset_prob_within_quiet = 0.50
+    stand_displaced_reset_initial_scale = 0.30
+    stand_displaced_reset_curriculum_steps = 36_000  # 1500 iter × 24 steps
     # 禁止父类 walking RSI 写入随机步态帧；站立环境使用上面的独立 RSI。
     rsi_prob = 0.0
 
@@ -130,6 +140,15 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     recovery_hold_s = 0.30
     recovery_capture_min_air_time_s = 0.12
     recovery_capture_min_step_distance_m = 0.03
+    # Canonical stance completion is diagnostic-only and does not change Table I rewards.
+    stance_recovery_width_tolerance_m = 0.008
+    stance_recovery_stagger_tolerance_m = 0.010
+    stance_recovery_yaw_tolerance_rad = 0.05
+    stance_recovery_projected_gravity_xy_max = 0.08
+    stance_recovery_lin_vel_xy_max = 0.08
+    stance_recovery_ang_vel_xy_max = 0.20
+    stance_recovery_joint_vel_rms_max = 0.25
+    stance_recovery_stable_hold_s = 0.30
 
     # 论文站立扰动从训练开始用 1500 iteration（24 steps/iter）线性放开。
     disturbance_curriculum_delay_steps = 0
