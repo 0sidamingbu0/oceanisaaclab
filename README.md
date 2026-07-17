@@ -139,9 +139,10 @@
   `stand_recovery_resets.npz` 只提供双脚贴地、CoM 平衡但脚距缩小/加宽、前后错位或相对 yaw
   偏移的出生状态。错误脚位绝不成为奖励参考，策略仍由固定 Table I 收益将其校正回 q=0 标准站姿。
   q、root、path frame、FOH/LPF 目标、延迟环和前两帧动作均从同一 reset 状态同步初始化。
-- **训练样本分层**：默认约 25% 标准无扰动、25% 错误脚位无扰动、50% 完整 Table V 扰动。
+- **训练样本分层**：默认约 50% 标准无扰动、20% 错误脚位无扰动、30% 完整 Table V 扰动。
   错误脚位幅度从 30% 开始，在前 1500 iteration 放开到 100%；分布标签不进入观测且不改变奖励。
-  当前库覆盖最大 50mm 脚距缩小、40mm 加宽、50mm 前后错位和 0.08rad 相对 yaw。
+  站立 episode 为 20s，以覆盖接触状态下 10--30s 的慢速脚位漂移；当前库覆盖最大 50mm 脚距
+  缩小、40mm 加宽、50mm 前后错位和 0.08rad 相对 yaw。
 - **path frame**：站立分支收敛到双脚中心和消除左右 link-frame 偏置后的双脚平均 heading，
   不是收敛到躯干 yaw；行走和站立使用同一份 path-frame 状态。
 - **动作与频率**：14 维动作与行走完全同构，50Hz policy / 200Hz low-level，腿和脖子目标都
@@ -158,11 +159,11 @@
       --checkpoint logs/rsl_rl/bdx_stand_perpetual/<run>/model_<iter>.pt
     ```
 
-旧 `74/76` 维站立 checkpoint 和 ONNX 在形状上不兼容；当前 77 维模型也不能续训，因为旧版
+旧 `74/76` 维站立 checkpoint 和 ONNX 在形状上不兼容；早期 77 维模型也不能续训，因为旧版
 恢复门控曾把 contact/腿姿态约束长期关闭，已学成小碎步局部解。必须从头训练并重新导出，再同步替换 OceanBDX 的
-`policy/stand/policy.onnx[.data]`。本次又改变了 reset 分布，正式模型应从头训练 100000 iteration；
-旧 checkpoint 只适合短期 A/B 检查。训练时重点监控 `fall_rate`、clean 锁脚、错误脚位恢复成功率/
-恢复时间、标准脚距误差和受扰捕获步。完整接口与迁移检查见
+`policy/stand/policy.onnx[.data]`。采用 Table I 固定奖励和错误脚位 reset 的兼容 checkpoint 可在本次
+样本比例与 episode 时长调整后续训；建议先做 5000--10000 iteration A/B，再决定是否长期续训。
+训练时重点监控 `fall_rate`、clean 锁脚、错误脚位恢复成功率/恢复时间、标准脚距误差和受扰捕获步。完整接口与迁移检查见
 [`BDX_STAND_TRAINING.md`](source/oceanisaaclab/docs/BDX_STAND_TRAINING.md)。
 
 运行时切换必须遵循论文 Fig.9：两策略共享最近两帧**实际归一化动作**、path frame 以及腿/脖子

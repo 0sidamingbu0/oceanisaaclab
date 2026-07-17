@@ -33,6 +33,10 @@ from .oceanisaaclab_walk_env_cfg import OceanisaaclabWalkEnvCfg
 class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     """BDX 论文复刻站立任务配置（Ocean-BDX-StandPaper-Direct-v0）。"""
 
+    # Perpetual standing must expose slow contact-preserving foot drift within one rollout.
+    # The inherited 8 s horizon was too short to represent the observed 10-30 s widening.
+    episode_length_s = 20.0
+
     # ------------------------------------------------------------------
     # 空间维度（无相位 + g_perp 8 维命令）
     # ------------------------------------------------------------------
@@ -80,9 +84,9 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     # ------------------------------------------------------------------
     stand_rsi_prob = 0.8
     stand_rsi_joint_pos_noise = 0.01  # [rad]，仅非零命令 RSI 使用
-    # Half of the no-disturbance episodes start from a stable non-canonical foot placement:
-    # 25% nominal clean + 25% displaced clean + 50% full Table V at the default probabilities.
-    stand_displaced_reset_prob_within_quiet = 0.50
+    # Two sevenths of the 70% no-disturbance episodes use a stable non-canonical foot
+    # placement: 50% canonical clean + 20% displaced clean + 30% full Table V overall.
+    stand_displaced_reset_prob_within_quiet = 2.0 / 7.0
     stand_displaced_reset_initial_scale = 0.30
     stand_displaced_reset_curriculum_steps = 36_000  # 1500 iter × 24 steps
     # 禁止父类 walking RSI 写入随机步态帧；站立环境使用上面的独立 RSI。
@@ -158,4 +162,4 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     # 样本；其余 episode 使用完整 Table V 独立扰动过程。该采样不改变奖励，也不
     # 改变扰动 episode 内的力/矩/开关时序，只避免小扰动几乎覆盖所有样本而诱发
     # “无扰动也挪脚”的局部解。真机部署不使用该标志。
-    stand_disturbance_quiet_prob = 0.50
+    stand_disturbance_quiet_prob = 0.70

@@ -186,7 +186,9 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
     def _displaced_reset_curriculum_scale(self) -> float:
         initial = float(self.cfg.stand_displaced_reset_initial_scale)
         duration = max(1, int(self.cfg.stand_displaced_reset_curriculum_steps))
-        progress = min(1.0, float(self.common_step_counter) / duration)
+        # Include the checkpoint-derived offset so resume does not restart only this
+        # curriculum while the paper disturbance/head curricula remain fully open.
+        progress = min(1.0, float(self._walk_curriculum_steps()) / duration)
         return initial + (1.0 - initial) * progress
 
     def _sample_stand_reset_modes(self, env_ids: torch.Tensor) -> None:

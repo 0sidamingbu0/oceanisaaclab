@@ -30,7 +30,8 @@ logs/rsl_rl/bdx_stand_perpetual/<run>/exported/policy.onnx.data
 旧 `74/76` 维 StandPaper checkpoint/ONNX 与当前接口形状不兼容。此前的 77 维模型虽然形状
 匹配，但训练时只使用约 1/3 head 命令域、旧的 reward recovery gate 和不同的扰动采样分布；
 它不能 resume 后当作本配置的结果，更不能直接接收完整 head 命令。当前 StandPaper 必须从头
-训练和重新导出。
+训练和重新导出。采用固定 Table I 奖励、完整 head 命令域、当前错误脚位 reset 的 77 维
+checkpoint 与本次样本比例及 episode 时长调整兼容，可直接续训做短期 A/B。
 
 ## 观测布局
 
@@ -132,8 +133,10 @@ foot span   = 0.25169745297 m
 
 - 标准参考始终来自 `stand_pose.npz`；`stand_recovery_resets.npz` 是独立 reset 库，不参与
   reward reference。窄脚距或错位状态因此必须恢复到标准站姿，不能被策略当作新的模仿目标。
-- 默认约 25% episode 从标准无扰动状态出生，25% 从稳定但非标准的脚位无扰动出生，另外
-  50% 使用完整 Table V 扰动。错误脚位 reset 强制 torso/head neutral。
+- 默认约 50% episode 从标准无扰动状态出生，20% 从稳定但非标准的脚位无扰动出生，另外
+  30% 使用完整 Table V 扰动。错误脚位 reset 强制 torso/head neutral。
+- 站立 episode 为 20s，使接触状态下 10--30s 时间尺度的慢速脚位漂移能在单个 episode 暴露；
+  PPO 每次 collection 仍为 24 control steps。
 - reset 库含 52 个双脚贴地且 CoM 平衡的 IK 解：单脚内收、双脚对称内收、单脚外扩、前后错位
   和单脚 yaw。最大脚距缩小 50mm、加宽 40mm、前后错位 50mm、相对 yaw 0.08rad。
 - 错误脚位幅度课程从 30% 开始，在 36000 control steps（1500 iteration）内放开到 100%。
@@ -175,7 +178,7 @@ python3 scripts/gen_stand_recovery_resets.py
 论文三档扰动从训练开始，在前 1500 iteration 线性放开。
 
 为适配本机“无扰动时脚应锁定、大扰动时允许捕获步、捕获后回标准脚位”的验收目标，当前训练
-将 episode 分为约 25% 标准无扰动、25% 错误脚位无扰动和 50% 完整 Table V 独立扰动。
+将 episode 分为约 50% 标准无扰动、20% 错误脚位无扰动和 30% 完整 Table V 独立扰动。
 扰动 episode 内的力/矩幅值、开关时长和课程不变；reset 类别和恢复完成状态不进入观测，
 不改变固定 Table I 奖励。恢复完成判定只用于统计，要求脚距、前后错位、相对 yaw 和物理稳定性
 连续满足门槛；它不指定抬哪只脚，也不直接发动作。
