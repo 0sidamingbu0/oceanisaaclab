@@ -27,11 +27,9 @@ logs/rsl_rl/bdx_stand_perpetual/<run>/exported/policy.onnx.data
 | StandPaper | 77 | 79 | 14 | 无 | torso 4 + head 4 |
 | Walk | 80 | 82 | 14 | 二阶谐波 4 | velocity 3 + head 4 |
 
-旧 `74/76` 维 StandPaper checkpoint/ONNX 与当前接口形状不兼容。此前的 77 维模型虽然形状
-匹配，但训练时只使用约 1/3 head 命令域、旧的 reward recovery gate 和不同的扰动采样分布；
-它不能 resume 后当作本配置的结果，更不能直接接收完整 head 命令。当前 StandPaper 必须从头
-训练和重新导出。采用固定 Table I 奖励、完整 head 命令域、当前错误脚位 reset 的 77 维
-checkpoint 与本次样本比例及 episode 时长调整兼容，可直接续训做短期 A/B。
+旧 `74/76` 维 StandPaper checkpoint/ONNX 与当前接口形状不兼容。77 维模型保持接口兼容，
+但头部命令范围和足端奖励属于训练分布/目标的一部分；修改后续训只能用于短期 A/B，正式模型
+应从头训练并重新导出。
 
 ## 观测布局
 
@@ -66,18 +64,17 @@ yaw    [-0.24, +0.24] rad
 roll   [-0.09, +0.09] rad
 ```
 
-站立 head 命令恢复 `neck_head_map.npz` 的完整可达域：
+站立 head 命令使用 `neck_head_map.npz` 完整可达域的 `2/3`，比此前完整范围减小 `1/3`：
 
 ```text
-dh     [-0.020, +0.020] m
-pitch  [-0.50, +0.50] rad
-yaw    [-1.00, +1.00] rad
-roll   [-0.60, +0.60] rad
+dh     [-0.013333, +0.013333] m
+pitch  [-0.333333, +0.333333] rad
+yaw    [-0.666667, +0.666667] rad
+roll   [-0.40, +0.40] rad
 ```
 
-walking 为抑制行进时的头部甩动，继续使用约 1/3 范围：`±0.007m / ±0.17 / ±0.33 /
-±0.20rad`。两套范围必须按当前实际运行的 policy 分开限幅，不能用 walking 限幅削弱站立表现，
-也不能把完整站立命令送给 walking policy。
+walking 为抑制行进时的头部甩动，继续使用约完整域的 1/3：`±0.007m / ±0.17 / ±0.33 /
+±0.20rad`。两套范围必须按当前实际运行的 policy 分开限幅。
 
 torso/head 命令在 episode 内每 `4-8s` 重采样，而不是只在 reset 时固定一次；这对应论文
 perpetual policy 接收连续控制输入的设定。
@@ -158,7 +155,7 @@ python3 scripts/gen_stand_recovery_resets.py
 
 ## 奖励与扰动
 
-站立使用论文 Table I 权重：
+站立以论文 Table I 为主体，并为本机严格锁脚目标增加两项足端约束：
 
 | 项 | 核/权重 |
 |---|---|
@@ -169,6 +166,8 @@ python3 scripts/gen_stand_recovery_resets.py
 | Leg / neck joint position | negative L2, 15 / 100 |
 | Leg / neck joint velocity | negative L2, 0.001 / 1 |
 | Contact match | 1 per foot |
+| Contact-foot planar speed | negative L1, 10 |
+| Airborne foot | negative count, 4 per foot |
 | All joint torques / accelerations | leg + neck negative L2, 0.001 / 2.5e-6 |
 | Leg / neck action rate | negative L2, 1.5 / 5 |
 | Leg / neck action acceleration | negative L2, 0.45 / 5 |
@@ -180,12 +179,12 @@ python3 scripts/gen_stand_recovery_resets.py
 为适配本机“无扰动时脚应锁定、大扰动时允许捕获步、捕获后回标准脚位”的验收目标，当前训练
 将 episode 分为约 50% 标准无扰动、20% 错误脚位无扰动和 30% 完整 Table V 独立扰动。
 扰动 episode 内的力/矩幅值、开关时长和课程不变；reset 类别和恢复完成状态不进入观测，
-不改变固定 Table I 奖励。恢复完成判定只用于统计，要求脚距、前后错位、相对 yaw 和物理稳定性
+也不改变任何奖励权重。恢复完成判定只用于统计，要求脚距、前后错位、相对 yaw 和物理稳定性
 连续满足门槛；它不指定抬哪只脚，也不直接发动作。
 
 静态参考的 contact schedule 仍为双脚支撑，但论文的受扰实验允许策略偏离参考轨迹和接触序列
 来恢复平衡。论文还明确指出，去掉腿姿态、腿速度或接触项会导致策略快速挪脚，因此当前实现
-始终固定使用 Table I，不再用恢复状态调整奖励权重，也不新增脚高、指定左右摆动脚或迈步奖励。
+始终固定使用这些核心项，并额外保持锁脚项；恢复状态不调整奖励，也没有脚高、指定摆动脚或迈步奖励。
 环境只用真机可获得的量计算恢复诊断状态：
 
 | 失稳量 | 归一化起点 | 归一化满量程 |

@@ -31,6 +31,10 @@ from oceanisaaclab.tasks.direct.oceanisaaclab.oceanisaaclab_stand_env_cfg import
 cfg = OceanisaaclabStandEnvCfg()
 cfg.scene.num_envs = args.num_envs
 cfg.sim.device = args.device if args.device else "cuda:0"
+# Keep a long diagnostic inside one episode; timeout resets would look like foot teleportation.
+cfg.episode_length_s = max(
+    cfg.episode_length_s, (args.steps + 2) * cfg.sim.dt * cfg.decimation
+)
 cfg.enable_paper_disturbance = False
 cfg.enable_obs_noise = False
 cfg.enable_action_latency = False
@@ -52,8 +56,8 @@ env = gym.make("Ocean-BDX-StandPaper-Direct-v0", cfg=cfg).unwrapped
 ck = torch.load(args.checkpoint, map_location=cfg.sim.device, weights_only=False)
 a = ck["actor_state_dict"]
 dev = cfg.sim.device
-obs_mean = a["obs_normalizer._mean"].to(dev)
-obs_std = a["obs_normalizer._std"].to(dev).clamp_min(1.0e-2)
+obs_mean = a["obs_normalizer._mean"].to(dev).reshape(-1)
+obs_std = a["obs_normalizer._std"].to(dev).reshape(-1).clamp_min(1.0e-2)
 W0, b0 = a["mlp.0.weight"].to(dev), a["mlp.0.bias"].to(dev)
 W2, b2 = a["mlp.2.weight"].to(dev), a["mlp.2.bias"].to(dev)
 W4, b4 = a["mlp.4.weight"].to(dev), a["mlp.4.bias"].to(dev)
@@ -97,6 +101,7 @@ joint_speed = []
 foot_in_contact = []
 both_contact = []
 foot_spacing = []
+foot_xy = []
 prev_force = None
 warmup = min(50, max(0, args.steps // 4))
 for step in range(args.steps):
@@ -116,6 +121,7 @@ for step in range(args.steps):
     foot_in_contact.append(in_contact.float())
     both_contact.append(torch.all(in_contact, dim=1).float())
     feet_xy = env.robot.data.body_pos_w.torch[:, env._feet_body_ids, :2]
+    foot_xy.append(feet_xy)
     foot_spacing.append(torch.norm(feet_xy[:, 0] - feet_xy[:, 1], dim=1))
     if prev_force is not None:
         force_rate.append(torch.norm(foot_force - prev_force, dim=-1))
@@ -128,7 +134,10 @@ JS = torch.stack(joint_speed)
 IC = torch.stack(foot_in_contact)
 BC = torch.stack(both_contact)
 FS = torch.stack(foot_spacing)
+FXY = torch.stack(foot_xy)
 FR = torch.stack(force_rate) if force_rate else torch.zeros_like(F[:1])
+foot_net_drift = torch.linalg.vector_norm(FXY[-1] - FXY[0], dim=2)
+foot_path_length = torch.linalg.vector_norm(FXY[1:] - FXY[:-1], dim=3).sum(dim=0)
 
 print("\n================ STAND POLICY DIAGNOSTICS (neutral, disturbances OFF) ================")
 print(f"checkpoint: {args.checkpoint}")
@@ -147,6 +156,14 @@ print(
     f"minimum={(-PG[..., 2]).min():.4f}"
 )
 print(f"foot spacing [m]: mean={FS.mean():.4f} std={FS.std():.4f}")
+print(
+    f"foot net drift [cm]: mean={100.0 * foot_net_drift.mean():.3f} "
+    f"max={100.0 * foot_net_drift.max():.3f}"
+)
+print(
+    f"foot cumulative drift [cm]: mean={100.0 * foot_path_length.mean():.3f} "
+    f"max={100.0 * foot_path_length.max():.3f}"
+)
 print(f"contact force/foot [N]: mean={F.mean():.2f} max={F.max():.1f}")
 print(
     f"contact-force rate [N/step]: mean={FR.mean():.2f} "

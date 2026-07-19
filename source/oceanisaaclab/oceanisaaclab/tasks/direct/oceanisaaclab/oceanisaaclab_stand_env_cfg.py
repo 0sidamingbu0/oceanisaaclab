@@ -57,12 +57,12 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
         OCEAN_ASSET_DIR / "gaits" / "stand_recovery_resets.npz"
     )
 
-    # Walking 为抑制行进时甩头使用约 1/3 的硬件适配范围。Perpetual standing 是论文的
-    # 表现性姿态策略，应独立恢复 neck_head_map.npz 覆盖的完整可达域，不能继承 walking 限幅。
-    head_command_dh_range = (-0.02, 0.02)
-    head_command_pitch_range = (-0.5, 0.5)
-    head_command_yaw_range = (-1.0, 1.0)
-    head_command_roll_range = (-0.6, 0.6)
+    # Keep a larger expressive range than walking, but leave one-third margin from the full
+    # neck_head_map domain. Full-range head inertia was enough to trigger unnecessary steps.
+    head_command_dh_range = (-0.013333, 0.013333)
+    head_command_pitch_range = (-0.333333, 0.333333)
+    head_command_yaw_range = (-0.666667, 0.666667)
+    head_command_roll_range = (-0.4, 0.4)
 
     # ------------------------------------------------------------------
     # 躯干命令 g_perp 的 (h_torso, θ_torso) 部分：4-DOF 高度 + 朝向。
@@ -111,6 +111,13 @@ class OceanisaaclabStandEnvCfg(OceanisaaclabWalkEnvCfg):
     rew_w_leg_joint_pos = -15.0  # 腿关节角模仿站立参考（负 L2）
     rew_w_leg_joint_vel = -1.0e-3
     rew_w_contact_match = 1.0  # 双脚均着地 Σ I[c=1]（站立参考接触恒 [1,1]）
+    # Contact match cannot see tangential motion. Penalize contact-foot XY speed directly so
+    # maintaining double support by pushing the soles across the floor is no longer free.
+    rew_w_feet_slide = -10.0
+    # Together with the lost +1 contact reward, one airborne foot costs 5 reward/s. This is
+    # deliberately finite: a short capture step can still pay for itself by avoiding a fall,
+    # while command-induced or exploratory lifts cannot.
+    rew_w_feet_airborne = -4.0
     enable_contact_match_curriculum = False  # perpetual stand 不使用行走接触课程
     rew_w_torque = -1.0e-3
     rew_w_joint_acc = -2.5e-6

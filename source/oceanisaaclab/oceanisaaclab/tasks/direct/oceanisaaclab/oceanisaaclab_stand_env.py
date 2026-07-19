@@ -108,6 +108,8 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
                 "leg_joint_pos",
                 "leg_joint_vel",
                 "contact_match",
+                "feet_slide",
+                "feet_airborne",
                 "torque",
                 "joint_acc",
                 "action_rate",
@@ -411,6 +413,7 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         neck_joint_pos = self.robot.data.joint_pos.torch[:, self._neck_dof_idx]
         neck_joint_vel = self.robot.data.joint_vel.torch[:, self._neck_dof_idx]
         in_contact = (self._feet_current_contact_time() > 0.0).float()
+        feet_lin_vel_xy = self.robot.data.body_lin_vel_w.torch[:, self._feet_body_ids, :2]
 
         # 命令：躯干 (h, pitch, yaw, roll)
         pitch_cmd = self._torso_commands[:, 1]
@@ -456,6 +459,13 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
         rew_contact = (
             cfg.rew_w_contact_match * contact_weight_scale * torch.sum(in_contact, dim=1)
         )
+        # Contact alone cannot distinguish a planted foot from a sole sliding under tangential
+        # load. Use the standard Isaac Lab contact-conditioned planar foot-speed penalty.
+        foot_speed_xy = torch.linalg.vector_norm(feet_lin_vel_xy, dim=2)
+        rew_feet_slide = cfg.rew_w_feet_slide * torch.sum(foot_speed_xy * in_contact, dim=1)
+        # Keep the lift cost finite and independent of the diagnostic recovery state. Large
+        # disturbances can still justify a short capture step through survival/fall avoidance.
+        rew_feet_airborne = cfg.rew_w_feet_airborne * torch.sum(1.0 - in_contact, dim=1)
         # 7) 正则：力矩 / 关节加速度 / 腿动作率 / 腿动作加速度
         neck_torque = self.robot.data.applied_torque.torch[:, self._neck_dof_idx]
         rew_torque = cfg.rew_w_torque * (
@@ -500,6 +510,8 @@ class OceanisaaclabStandEnv(OceanisaaclabWalkEnv):
             "leg_joint_pos": rew_joint_pos,
             "leg_joint_vel": rew_joint_vel,
             "contact_match": rew_contact,
+            "feet_slide": rew_feet_slide,
+            "feet_airborne": rew_feet_airborne,
             "torque": rew_torque,
             "joint_acc": rew_joint_acc,
             "action_rate": rew_action_rate,
