@@ -115,8 +115,8 @@
   + 头部 4-DOF（Δh / pitch / yaw / roll，复用 `neck_head_map`）。本机双脚约束 IK 扫描后的
   torso 可行域为 h `[-0.04,+0.01]m`、pitch `±0.17rad`、yaw `±0.24rad`、roll
   `±0.09rad`。StandPaper 的 head 域为完整映射的 2/3：Δh `±0.013333m`、pitch
-  `±0.333333rad`、yaw `±0.666667rad`、roll `±0.40rad`；walking 仍保持约 1/3 域
-  (`±0.007m / ±0.17 / ±0.33 / ±0.20rad`)。命令在 episode 内每 `4-8s` 重采样，覆盖论文
+  `±0.333333rad`、yaw `±0.666667rad`、roll `±0.40rad`；walking 使用完整域的 1/2
+  (`±0.01m / ±0.25 / ±0.50 / ±0.30rad`)。命令在 episode 内每 `4-8s` 重采样，覆盖论文
   要求的连续控制输入。
 - **观测 77 维**：相比行走去掉相位二阶谐波(4)、命令由 vx/vy/wz(3) 换成躯干命令(4)
   （净 −3）；保留 path 系 xy/yaw、`projected_gravity`、body 线/角速度、腿+脖子 q/q̇、

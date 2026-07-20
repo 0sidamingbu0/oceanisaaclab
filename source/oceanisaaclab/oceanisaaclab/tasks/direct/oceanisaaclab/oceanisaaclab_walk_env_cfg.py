@@ -147,11 +147,11 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     neck_action_joint_ranges = (0.8, 0.8, 1.2, 0.7)  # [rad]
     # model_1400 remains stable while the old curriculum is at 20%, but neck tracking loss
     # grows rapidly as the four simultaneous commands approach their old limits. Keep the
-    # paper's 4-DOF command interface and map, with a hardware-adapted range near one third.
-    head_command_dh_range = (-0.007, 0.007)  # [m] 头高偏移
-    head_command_pitch_range = (-0.17, 0.17)  # [rad] 点头
-    head_command_yaw_range = (-0.33, 0.33)  # [rad] 摇头
-    head_command_roll_range = (-0.20, 0.20)  # [rad] 歪头
+    # paper's 4-DOF command interface and map, with half of the full hardware-adapted range.
+    head_command_dh_range = (-0.01, 0.01)  # [m] 头高偏移
+    head_command_pitch_range = (-0.25, 0.25)  # [rad] 点头
+    head_command_yaw_range = (-0.50, 0.50)  # [rad] 摇头
+    head_command_roll_range = (-0.30, 0.30)  # [rad] 歪头
     # 头命令 obs 缩放（dh 量级小，放大到与其它命令可比；obs_normalization 亦会归一）
     head_command_scale = (20.0, 1.0, 1.0, 1.0)
     # Keep command transitions in training, but allow the 1rad/s neck servos to settle before
