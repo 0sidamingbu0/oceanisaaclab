@@ -290,9 +290,11 @@ class OceanisaaclabWalkEnvCfg(OceanisaaclabEnvCfg):
     dist_small_long_torque = (0.0, 0.25)
     dist_small_long_on_s = (2.0, 10.0)
     dist_small_long_off_s = (1.0, 3.0)
-    # 短/大：盆骨。论文 [90,150]N / [0,15]Nm ×0.65 质量比
+    # 短/大：盆骨。论文 [90,150]N / [0,15]Nm ×0.65 质量比。
+    # force_xy 表示平面合力幅值；50% 固定覆盖 ±X/±Y，50% 均匀随机方向。
     dist_large_bodies = ("base_link",)
     dist_large_force_xy = (58.0, 97.0)
+    dist_large_axis_aligned_prob = 0.5
     dist_large_force_z = (0.0, 6.5)
     dist_large_torque = (0.0, 9.7)
     dist_large_on_s = (0.1, 0.1)

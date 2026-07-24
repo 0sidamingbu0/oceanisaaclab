@@ -52,6 +52,7 @@ class _DisturbanceSchedule:
         on_s: tuple[float, float],
         off_s: tuple[float, float],
         device: torch.device,
+        planar_axis_prob: float | None = None,
     ):
         self.body_ids = body_ids
         self.force_xy = force_xy
@@ -59,6 +60,9 @@ class _DisturbanceSchedule:
         self.torque = torque
         self.on_s = on_s
         self.off_s = off_s
+        if planar_axis_prob is not None and not 0.0 <= planar_axis_prob <= 1.0:
+            raise ValueError(f"planar_axis_prob must be in [0, 1], got {planar_axis_prob}")
+        self.planar_axis_prob = planar_axis_prob
         n_b = len(body_ids)
         self.forces = torch.zeros(num_envs, n_b, 3, device=device)
         self.torques = torch.zeros(num_envs, n_b, 3, device=device)
@@ -83,13 +87,26 @@ class _DisturbanceSchedule:
             self.off_left[ended] = sample_uniform(
                 self.off_s[0], self.off_s[1], (int(ended.sum()),), device
             )
-        # "off" 结束 → 抽新扰动（逐维独立采样，随机符号；课程缩放幅值）
+        # "off" 结束 → 抽新扰动（课程缩放幅值）
         start = (self.on_left <= 0.0) & (self.off_left <= 0.0)
         if torch.any(start):
             n = int(start.sum())
             f = torch.zeros(n, 3, device=device)
-            f[:, 0] = self._signed_uniform(*self.force_xy, (n,), device)
-            f[:, 1] = self._signed_uniform(*self.force_xy, (n,), device)
+            if self.planar_axis_prob is None:
+                # Preserve the paper's independent component sampling for small disturbances.
+                f[:, 0] = self._signed_uniform(*self.force_xy, (n,), device)
+                f[:, 1] = self._signed_uniform(*self.force_xy, (n,), device)
+            else:
+                # Treat force_xy as the total planar magnitude. Half-axis/half-uniform
+                # sampling gives pure sagittal/lateral pushes explicit coverage without
+                # inflating diagonal force by sqrt(2).
+                magnitude = sample_uniform(*self.force_xy, (n,), device)
+                angle = sample_uniform(0.0, 2.0 * math.pi, (n,), device)
+                axial = torch.rand(n, device=device) < self.planar_axis_prob
+                axis_angle = torch.randint(0, 4, (n,), device=device) * (0.5 * math.pi)
+                angle = torch.where(axial, axis_angle, angle)
+                f[:, 0] = magnitude * torch.cos(angle)
+                f[:, 1] = magnitude * torch.sin(angle)
             f[:, 2] = self._signed_uniform(*self.force_z, (n,), device)
             t = self._signed_uniform(*self.torque, (n, 3), device)
             self.forces[start] = f * scale
@@ -219,6 +236,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
                     self.cfg.dist_small_short_torque,
                     self.cfg.dist_small_short_on_s,
                     self.cfg.dist_small_short_off_s,
+                    None,
                 ),
                 (
                     self.cfg.dist_small_long_bodies,
@@ -227,6 +245,7 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
                     self.cfg.dist_small_long_torque,
                     self.cfg.dist_small_long_on_s,
                     self.cfg.dist_small_long_off_s,
+                    None,
                 ),
                 (
                     self.cfg.dist_large_bodies,
@@ -235,13 +254,22 @@ class OceanisaaclabWalkEnv(OceanisaaclabEnv):
                     self.cfg.dist_large_torque,
                     self.cfg.dist_large_on_s,
                     self.cfg.dist_large_off_s,
+                    self.cfg.dist_large_axis_aligned_prob,
                 ),
             ]
-            for bodies, f_xy, f_z, tq, on_s, off_s in groups:
+            for bodies, f_xy, f_z, tq, on_s, off_s, planar_axis_prob in groups:
                 body_ids, _ = self.robot.find_bodies(list(bodies), preserve_order=True)
                 self._disturbances.append(
                     _DisturbanceSchedule(
-                        self.num_envs, body_ids, f_xy, f_z, tq, on_s, off_s, self.device
+                        self.num_envs,
+                        body_ids,
+                        f_xy,
+                        f_z,
+                        tq,
+                        on_s,
+                        off_s,
+                        self.device,
+                        planar_axis_prob,
                     )
                 )
             self._dist_body_ids = sorted({bid for sched in self._disturbances for bid in sched.body_ids})
